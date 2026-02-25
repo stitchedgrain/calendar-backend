@@ -24,7 +24,10 @@ GOOGLE_REDIRECT_URL = os.getenv("GOOGLE_REDIRECT_URL", "")
 
 # Scopes (you said you added both; we request the broad one for MVP)
 GOOGLE_SCOPES = [
-    "https://www.googleapis.com/auth/calendar",
+     "https://www.googleapis.com/auth/calendar",
+     "openid",
+     "email",
+     "profile",
     # "https://www.googleapis.com/auth/calendar.events",  # redundant if calendar is present
 ]
 
