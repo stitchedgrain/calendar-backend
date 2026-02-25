@@ -5,12 +5,11 @@ from typing import List, Optional, Dict, Any
 from urllib.parse import urlencode
 
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import RedirectResponse, JSONResponse
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
-
 
 app = FastAPI()
 
@@ -22,29 +21,20 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REDIRECT_URL = os.getenv("GOOGLE_REDIRECT_URL", "")
 
-# Scopes (you said you added both; we request the broad one for MVP)
 GOOGLE_SCOPES = [
-     "https://www.googleapis.com/auth/calendar",
-     "openid",
-     "email",
-     "profile",
-    # "https://www.googleapis.com/auth/calendar.events",  # redundant if calendar is present
+    "https://www.googleapis.com/auth/calendar",
+    "openid",
+    "email",
+    "profile",
 ]
 
-# -----------------------------
-# Google endpoints
-# -----------------------------
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 
-# Google Calendar endpoints
 GOOGLE_FREEBUSY_URL = "https://www.googleapis.com/calendar/v3/freeBusy"
 GOOGLE_EVENTS_INSERT_URL = "https://www.googleapis.com/calendar/v3/calendars/{calendarId}/events"
 
-# -----------------------------
-# DB setup (Postgres via Render)
-# -----------------------------
 engine = None
 
 
@@ -63,23 +53,11 @@ def require_env():
 
 
 def make_engine():
-    """
-    Render typically provides DATABASE_URL starting with:
-      postgres://user:pass@host/db
-
-    SQLAlchemy 2.x prefers a driver-qualified URL:
-      postgresql+psycopg://user:pass@host/db
-
-    This prevents SQLAlchemy from defaulting to psycopg2.
-    """
     url = DATABASE_URL.strip()
-
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+psycopg://", 1)
     elif url.startswith("postgresql://"):
-        # If it's postgresql:// without driver, still force psycopg (v3)
         url = url.replace("postgresql://", "postgresql+psycopg://", 1)
-
     return create_engine(url, pool_pre_ping=True)
 
 
@@ -89,20 +67,25 @@ def init_db():
     engine = make_engine()
     try:
         with engine.begin() as conn:
+            # Tokens keyed by customer_id (not email)
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS oauth_tokens (
                   provider TEXT NOT NULL,
-                  user_email TEXT NOT NULL,
+                  customer_id TEXT NOT NULL,
+                  user_email TEXT,
                   refresh_token TEXT NOT NULL,
                   scope TEXT,
                   token_type TEXT,
                   created_at TIMESTAMPTZ DEFAULT NOW(),
-                  PRIMARY KEY (provider, user_email)
+                  PRIMARY KEY (provider, customer_id)
                 );
             """))
+
+            # State table stores state -> customer_id mapping
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS oauth_states (
                   state TEXT PRIMARY KEY,
+                  customer_id TEXT NOT NULL,
                   created_at TIMESTAMPTZ DEFAULT NOW()
                 );
             """))
@@ -110,52 +93,83 @@ def init_db():
         raise RuntimeError(f"DB init failed: {e}") from e
 
 
-# Initialize DB at import time so the service fails fast if env/DB is wrong.
 init_db()
 
 # -----------------------------
 # DB helpers
 # -----------------------------
-def save_state(state: str):
-    with engine.begin() as conn:
-        conn.execute(
-            text("INSERT INTO oauth_states(state) VALUES (:state) ON CONFLICT (state) DO NOTHING"),
-            {"state": state},
-        )
-
-
-def consume_state(state: str) -> bool:
-    with engine.begin() as conn:
-        row = conn.execute(
-            text("SELECT state FROM oauth_states WHERE state=:state"),
-            {"state": state},
-        ).fetchone()
-        if not row:
-            return False
-        conn.execute(text("DELETE FROM oauth_states WHERE state=:state"), {"state": state})
-        return True
-
-
-def upsert_refresh_token(user_email: str, refresh_token: str, scope: str, token_type: str):
+def save_state(state: str, customer_id: str):
     with engine.begin() as conn:
         conn.execute(
             text("""
-                INSERT INTO oauth_tokens(provider, user_email, refresh_token, scope, token_type)
-                VALUES ('google', :email, :rt, :scope, :tt)
-                ON CONFLICT (provider, user_email) DO UPDATE SET
-                  refresh_token = EXCLUDED.refresh_token,
-                  scope = EXCLUDED.scope,
-                  token_type = EXCLUDED.token_type;
+                INSERT INTO oauth_states(state, customer_id)
+                VALUES (:state, :customer_id)
+                ON CONFLICT (state) DO UPDATE SET customer_id = EXCLUDED.customer_id
             """),
-            {"email": user_email, "rt": refresh_token, "scope": scope, "tt": token_type},
+            {"state": state, "customer_id": customer_id},
         )
 
 
-def load_refresh_token(user_email: str) -> Optional[str]:
+def consume_state(state: str) -> Optional[str]:
+    """
+    Returns customer_id if state exists, then deletes it.
+    """
     with engine.begin() as conn:
         row = conn.execute(
-            text("SELECT refresh_token FROM oauth_tokens WHERE provider='google' AND user_email=:email"),
-            {"email": user_email},
+            text("SELECT customer_id FROM oauth_states WHERE state=:state"),
+            {"state": state},
+        ).fetchone()
+        if not row:
+            return None
+        customer_id = row[0]
+        conn.execute(text("DELETE FROM oauth_states WHERE state=:state"), {"state": state})
+        return customer_id
+
+
+def upsert_refresh_token(customer_id: str, refresh_token: str, scope: str, token_type: str, user_email: Optional[str]):
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO oauth_tokens(provider, customer_id, user_email, refresh_token, scope, token_type)
+                VALUES ('google', :customer_id, :user_email, :rt, :scope, :tt)
+                ON CONFLICT (provider, customer_id) DO UPDATE SET
+                  user_email = EXCLUDED.user_email,
+                  refresh_token = EXCLUDED.refresh_token,
+                  scope = EXCLUDED.scope,
+                  token_type = EXCLUDED.token_type
+            """),
+            {
+                "customer_id": customer_id,
+                "user_email": user_email,
+                "rt": refresh_token,
+                "scope": scope,
+                "tt": token_type,
+            },
+        )
+
+
+def load_refresh_token_by_customer(customer_id: str) -> Optional[str]:
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("""
+                SELECT refresh_token
+                FROM oauth_tokens
+                WHERE provider='google' AND customer_id=:customer_id
+            """),
+            {"customer_id": customer_id},
+        ).fetchone()
+        return row[0] if row else None
+
+
+def load_customer_email(customer_id: str) -> Optional[str]:
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("""
+                SELECT user_email
+                FROM oauth_tokens
+                WHERE provider='google' AND customer_id=:customer_id
+            """),
+            {"customer_id": customer_id},
         ).fetchone()
         return row[0] if row else None
 
@@ -233,13 +247,18 @@ def terms():
 
 
 # -----------------------------
-# Google OAuth routes
+# OAuth connect flow (customerId)
 # -----------------------------
 @app.get("/oauth/google/start")
-def google_oauth_start():
+def google_oauth_start(customerId: str = Query(..., description="Your internal customer/location id")):
+    """
+    Example:
+      /oauth/google/start?customerId=pm_123
+    """
     require_env()
+
     state = secrets.token_urlsafe(24)
-    save_state(state)
+    save_state(state, customerId)
 
     params = {
         "client_id": GOOGLE_CLIENT_ID,
@@ -247,7 +266,7 @@ def google_oauth_start():
         "response_type": "code",
         "scope": " ".join(GOOGLE_SCOPES),
         "access_type": "offline",
-        "prompt": "consent",  # forces refresh_token the first time
+        "prompt": "consent",
         "include_granted_scopes": "true",
         "state": state,
     }
@@ -263,14 +282,12 @@ def google_oauth_callback(code: Optional[str] = None, state: Optional[str] = Non
         raise HTTPException(status_code=400, detail=f"Google OAuth error: {error}")
     if not code or not state:
         raise HTTPException(status_code=400, detail="Missing code/state.")
-    if not consume_state(state):
+
+    customer_id = consume_state(state)
+    if not customer_id:
         raise HTTPException(status_code=400, detail="Invalid or expired state.")
 
     tokens = exchange_code_for_tokens(code)
-    
-    # TEMP DEBUG (remove later)
-    if "access_token" not in tokens:
-        return JSONResponse({"debug_tokens": tokens}, status_code=200)
 
     access_token = tokens.get("access_token")
     refresh_token = tokens.get("refresh_token")
@@ -283,35 +300,36 @@ def google_oauth_callback(code: Optional[str] = None, state: Optional[str] = Non
     user_email = get_user_email(access_token)
 
     if not refresh_token:
-        # Google sometimes doesn't return refresh_token if user already consented earlier.
-        existing = load_refresh_token(user_email)
+        existing = load_refresh_token_by_customer(customer_id)
         if not existing:
             return JSONResponse(
                 {
                     "connected": False,
+                    "customerId": customer_id,
                     "email": user_email,
                     "message": "No refresh token returned. Remove the app from Google Account permissions and try again.",
                 }
             )
         refresh_token = existing
 
-    upsert_refresh_token(user_email, refresh_token, scope, token_type)
+    upsert_refresh_token(customer_id, refresh_token, scope, token_type, user_email)
 
     return {
         "connected": True,
+        "customerId": customer_id,
         "email": user_email,
-        "message": "Google connected. Call /google/freebusy and /google/create_event.",
+        "message": "Google connected for this customerId. Use customerId in /google/freebusy and /google/create_event.",
     }
 
 
 # -----------------------------
-# API: FreeBusy + Create Event
+# API: FreeBusy + Create Event (customerId)
 # -----------------------------
 @app.post("/google/freebusy")
 async def google_freebusy(payload: Dict[str, Any]):
     """
     {
-      "userEmail": "your@gmail.com",
+      "customerId": "pm_123",
       "timeMin": "2026-02-24T08:00:00-07:00",
       "timeMax": "2026-02-24T18:00:00-07:00",
       "timeZone": "America/Denver",
@@ -320,18 +338,18 @@ async def google_freebusy(payload: Dict[str, Any]):
     """
     require_env()
 
-    user_email = payload.get("userEmail")
+    customer_id = payload.get("customerId")
     time_min = payload.get("timeMin")
     time_max = payload.get("timeMax")
     tz = payload.get("timeZone", "America/Denver")
     calendar_ids: List[str] = payload.get("calendarIds", ["primary"])
 
-    if not user_email or not time_min or not time_max:
-        raise HTTPException(status_code=400, detail="Missing userEmail/timeMin/timeMax.")
+    if not customer_id or not time_min or not time_max:
+        raise HTTPException(status_code=400, detail="Missing customerId/timeMin/timeMax.")
 
-    rt = load_refresh_token(user_email)
+    rt = load_refresh_token_by_customer(customer_id)
     if not rt:
-        raise HTTPException(status_code=401, detail="User not connected. Visit /oauth/google/start first.")
+        raise HTTPException(status_code=401, detail="Customer not connected. Run /oauth/google/start?customerId=... first.")
 
     access_token = refresh_access_token(rt)
 
@@ -358,7 +376,7 @@ async def google_freebusy(payload: Dict[str, Any]):
 async def google_create_event(payload: Dict[str, Any]):
     """
     {
-      "userEmail": "your@gmail.com",
+      "customerId": "pm_123",
       "calendarId": "primary",
       "summary": "Maintenance visit",
       "description": "Fix sink",
@@ -369,15 +387,15 @@ async def google_create_event(payload: Dict[str, Any]):
     """
     require_env()
 
-    user_email = payload.get("userEmail")
+    customer_id = payload.get("customerId")
     calendar_id = payload.get("calendarId", "primary")
 
-    if not user_email:
-        raise HTTPException(status_code=400, detail="Missing userEmail.")
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="Missing customerId.")
 
-    rt = load_refresh_token(user_email)
+    rt = load_refresh_token_by_customer(customer_id)
     if not rt:
-        raise HTTPException(status_code=401, detail="User not connected. Visit /oauth/google/start first.")
+        raise HTTPException(status_code=401, detail="Customer not connected. Run /oauth/google/start?customerId=... first.")
 
     access_token = refresh_access_token(rt)
     url = GOOGLE_EVENTS_INSERT_URL.format(calendarId=calendar_id)
@@ -406,3 +424,22 @@ async def google_create_event(payload: Dict[str, Any]):
         raise HTTPException(status_code=400, detail=f"Create event failed: {r.text}")
 
     return r.json()
+
+
+# Optional helper endpoint (safe): list connected customers
+@app.get("/connections/google")
+def list_google_connections():
+    require_env()
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT customer_id, user_email, created_at
+            FROM oauth_tokens
+            WHERE provider='google'
+            ORDER BY created_at DESC
+            LIMIT 200
+        """)).fetchall()
+
+    return [
+        {"customerId": r[0], "email": r[1], "connectedAt": str(r[2])}
+        for r in rows
+    ]
