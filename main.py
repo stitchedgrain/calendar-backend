@@ -11,26 +11,38 @@ from fastapi.responses import RedirectResponse, JSONResponse
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
+
 app = FastAPI()
 
 # -----------------------------
-# Env vars (set these in Render)
+# Environment variables (Render)
 # -----------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REDIRECT_URL = os.getenv("GOOGLE_REDIRECT_URL", "")
 
+# Scopes (you said you added both; we request the broad one for MVP)
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/calendar",
     # "https://www.googleapis.com/auth/calendar.events",  # redundant if calendar is present
 ]
 
+# -----------------------------
+# Google endpoints
+# -----------------------------
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
+
+# Google Calendar endpoints
 GOOGLE_FREEBUSY_URL = "https://www.googleapis.com/calendar/v3/freeBusy"
 GOOGLE_EVENTS_INSERT_URL = "https://www.googleapis.com/calendar/v3/calendars/{calendarId}/events"
-GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
+
+# -----------------------------
+# DB setup (Postgres via Render)
+# -----------------------------
+engine = None
 
 
 def require_env():
@@ -47,15 +59,25 @@ def require_env():
         raise HTTPException(status_code=500, detail=f"Missing env vars: {', '.join(missing)}")
 
 
-# -----------------------------
-# Postgres (SQLAlchemy engine)
-# -----------------------------
 def make_engine():
-    # Render DATABASE_URL is usually postgres://... which SQLAlchemy accepts.
-    # pool_pre_ping helps recover from idle disconnects.
-    return create_engine(DATABASE_URL, pool_pre_ping=True)
+    """
+    Render typically provides DATABASE_URL starting with:
+      postgres://user:pass@host/db
 
-engine = None
+    SQLAlchemy 2.x prefers a driver-qualified URL:
+      postgresql+psycopg://user:pass@host/db
+
+    This prevents SQLAlchemy from defaulting to psycopg2.
+    """
+    url = DATABASE_URL.strip()
+
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+psycopg://", 1)
+    elif url.startswith("postgresql://"):
+        # If it's postgresql:// without driver, still force psycopg (v3)
+        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+
+    return create_engine(url, pool_pre_ping=True)
 
 
 def init_db():
@@ -85,10 +107,8 @@ def init_db():
         raise RuntimeError(f"DB init failed: {e}") from e
 
 
-# Init at import time (Render will have env vars)
-# If you prefer, move this into a startup event.
+# Initialize DB at import time so the service fails fast if env/DB is wrong.
 init_db()
-
 
 # -----------------------------
 # DB helpers
@@ -100,6 +120,7 @@ def save_state(state: str):
             {"state": state},
         )
 
+
 def consume_state(state: str) -> bool:
     with engine.begin() as conn:
         row = conn.execute(
@@ -110,6 +131,7 @@ def consume_state(state: str) -> bool:
             return False
         conn.execute(text("DELETE FROM oauth_states WHERE state=:state"), {"state": state})
         return True
+
 
 def upsert_refresh_token(user_email: str, refresh_token: str, scope: str, token_type: str):
     with engine.begin() as conn:
@@ -124,6 +146,7 @@ def upsert_refresh_token(user_email: str, refresh_token: str, scope: str, token_
             """),
             {"email": user_email, "rt": refresh_token, "scope": scope, "tt": token_type},
         )
+
 
 def load_refresh_token(user_email: str) -> Optional[str]:
     with engine.begin() as conn:
@@ -150,6 +173,7 @@ def exchange_code_for_tokens(code: str) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=f"Token exchange failed: {r.text}")
     return r.json()
 
+
 def refresh_access_token(refresh_token: str) -> str:
     payload = {
         "client_id": GOOGLE_CLIENT_ID,
@@ -160,7 +184,11 @@ def refresh_access_token(refresh_token: str) -> str:
     r = requests.post(GOOGLE_TOKEN_URL, data=payload, timeout=30)
     if r.status_code != 200:
         raise HTTPException(status_code=400, detail=f"Token refresh failed: {r.text}")
-    return r.json()["access_token"]
+    data = r.json()
+    if "access_token" not in data:
+        raise HTTPException(status_code=400, detail=f"Token refresh returned no access_token: {data}")
+    return data["access_token"]
+
 
 def get_user_email(access_token: str) -> str:
     r = requests.get(
@@ -183,15 +211,18 @@ def get_user_email(access_token: str) -> str:
 def root():
     return {"status": "server is alive"}
 
+
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
 @app.get("/privacy")
 def privacy():
     return {
         "policy": "This application accesses your calendar only to read availability and create bookings you request. We do not sell your data."
     }
+
 
 @app.get("/terms")
 def terms():
@@ -213,11 +244,13 @@ def google_oauth_start():
         "response_type": "code",
         "scope": " ".join(GOOGLE_SCOPES),
         "access_type": "offline",
-        "prompt": "consent",
+        "prompt": "consent",  # forces refresh_token the first time
         "include_granted_scopes": "true",
         "state": state,
     }
+
     return RedirectResponse(f"{GOOGLE_AUTH_URL}?{urlencode(params)}")
+
 
 @app.get("/oauth/google/callback")
 def google_oauth_callback(code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
@@ -231,6 +264,7 @@ def google_oauth_callback(code: Optional[str] = None, state: Optional[str] = Non
         raise HTTPException(status_code=400, detail="Invalid or expired state.")
 
     tokens = exchange_code_for_tokens(code)
+
     access_token = tokens.get("access_token")
     refresh_token = tokens.get("refresh_token")
     scope = tokens.get("scope", "")
@@ -242,7 +276,7 @@ def google_oauth_callback(code: Optional[str] = None, state: Optional[str] = Non
     user_email = get_user_email(access_token)
 
     if not refresh_token:
-        # If Google didn't return a refresh token, we can reuse an existing one (if present)
+        # Google sometimes doesn't return refresh_token if user already consented earlier.
         existing = load_refresh_token(user_email)
         if not existing:
             return JSONResponse(
@@ -277,6 +311,8 @@ async def google_freebusy(payload: Dict[str, Any]):
       "calendarIds": ["primary", "some_calendar_id@group.calendar.google.com"]
     }
     """
+    require_env()
+
     user_email = payload.get("userEmail")
     time_min = payload.get("timeMin")
     time_max = payload.get("timeMax")
@@ -310,6 +346,7 @@ async def google_freebusy(payload: Dict[str, Any]):
 
     return r.json()
 
+
 @app.post("/google/create_event")
 async def google_create_event(payload: Dict[str, Any]):
     """
@@ -323,6 +360,8 @@ async def google_create_event(payload: Dict[str, Any]):
       "attendees": [{"email":"tenant@example.com"}]
     }
     """
+    require_env()
+
     user_email = payload.get("userEmail")
     calendar_id = payload.get("calendarId", "primary")
 
@@ -334,7 +373,6 @@ async def google_create_event(payload: Dict[str, Any]):
         raise HTTPException(status_code=401, detail="User not connected. Visit /oauth/google/start first.")
 
     access_token = refresh_access_token(rt)
-
     url = GOOGLE_EVENTS_INSERT_URL.format(calendarId=calendar_id)
 
     event_body = {
@@ -344,12 +382,12 @@ async def google_create_event(payload: Dict[str, Any]):
         "end": payload.get("end"),
     }
 
+    if not event_body["start"] or not event_body["end"]:
+        raise HTTPException(status_code=400, detail="Missing start/end in payload.")
+
     attendees = payload.get("attendees")
     if attendees:
         event_body["attendees"] = attendees
-
-    if not event_body["start"] or not event_body["end"]:
-        raise HTTPException(status_code=400, detail="Missing start/end in payload.")
 
     r = requests.post(
         url,
