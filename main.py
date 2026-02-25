@@ -33,7 +33,7 @@ GOOGLE_SCOPES = [
 # -----------------------------
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
+GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 
 # Google Calendar endpoints
 GOOGLE_FREEBUSY_URL = "https://www.googleapis.com/calendar/v3/freeBusy"
