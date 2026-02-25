@@ -264,6 +264,9 @@ def google_oauth_callback(code: Optional[str] = None, state: Optional[str] = Non
         raise HTTPException(status_code=400, detail="Invalid or expired state.")
 
     tokens = exchange_code_for_tokens(code)
+    # TEMP DEBUG (remove later)
+if "access_token" not in tokens:
+    return JSONResponse({"debug_tokens": tokens}, status_code=200)
 
     access_token = tokens.get("access_token")
     refresh_token = tokens.get("refresh_token")
