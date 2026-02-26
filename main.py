@@ -443,13 +443,27 @@ def list_google_connections():
         {"customerId": r[0], "email": r[1], "connectedAt": str(r[2])}
         for r in rows
     ]
-# TEMPORARY: one-time database migration endpoint
-@app.get("/__migrate")
-def run_migration():
+@app.get("/__migrate2")
+def run_migration2():
     try:
         with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE oauth_states ADD COLUMN IF NOT EXISTS customer_id TEXT;"))
+            # Ensure column exists
             conn.execute(text("ALTER TABLE oauth_tokens ADD COLUMN IF NOT EXISTS customer_id TEXT;"))
-        return {"migration": "completed"}
+
+            # Create a unique constraint for ON CONFLICT (provider, customer_id)
+            conn.execute(text("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'oauth_tokens_provider_customer_id_uniq'
+                    ) THEN
+                        ALTER TABLE oauth_tokens
+                        ADD CONSTRAINT oauth_tokens_provider_customer_id_uniq UNIQUE (provider, customer_id);
+                    END IF;
+                END
+                $$;
+            """))
+        return {"migration2": "completed"}
     except Exception as e:
-        return {"migration": "failed", "error": str(e)}
+        return {"migration2": "failed", "error": str(e)}
