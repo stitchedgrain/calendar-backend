@@ -443,3 +443,13 @@ def list_google_connections():
         {"customerId": r[0], "email": r[1], "connectedAt": str(r[2])}
         for r in rows
     ]
+# TEMPORARY: one-time database migration endpoint
+@app.get("/__migrate")
+def run_migration():
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE oauth_states ADD COLUMN IF NOT EXISTS customer_id TEXT;"))
+            conn.execute(text("ALTER TABLE oauth_tokens ADD COLUMN IF NOT EXISTS customer_id TEXT;"))
+        return {"migration": "completed"}
+    except Exception as e:
+        return {"migration": "failed", "error": str(e)}
