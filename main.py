@@ -443,28 +443,3 @@ def list_google_connections():
         {"customerId": r[0], "email": r[1], "connectedAt": str(r[2])}
         for r in rows
     ]
-@app.get("/__reset_oauth")
-def reset_oauth_tables():
-    try:
-        with engine.begin() as conn:
-            # 1) Wipe existing test data (you will reconnect after this)
-            conn.execute(text("TRUNCATE TABLE oauth_states;"))
-            conn.execute(text("TRUNCATE TABLE oauth_tokens;"))
-
-            # 2) Ensure columns exist
-            conn.execute(text("ALTER TABLE oauth_states ADD COLUMN IF NOT EXISTS customer_id TEXT;"))
-            conn.execute(text("ALTER TABLE oauth_tokens ADD COLUMN IF NOT EXISTS customer_id TEXT;"))
-
-            # 3) Drop old constraints that can conflict with the new design
-            conn.execute(text("ALTER TABLE oauth_tokens DROP CONSTRAINT IF EXISTS oauth_tokens_pkey;"))
-            conn.execute(text("ALTER TABLE oauth_tokens DROP CONSTRAINT IF EXISTS oauth_tokens_provider_customer_id_uniq;"))
-
-            # 4) Make customer_id required going forward
-            conn.execute(text("ALTER TABLE oauth_tokens ALTER COLUMN customer_id SET NOT NULL;"))
-
-            # 5) Set the correct primary key for the new upsert target
-            conn.execute(text("ALTER TABLE oauth_tokens ADD PRIMARY KEY (provider, customer_id);"))
-
-        return {"reset": "completed"}
-    except Exception as e:
-        return {"reset": "failed", "error": str(e)}
