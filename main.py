@@ -443,3 +443,25 @@ def list_google_connections():
         {"customerId": r[0], "email": r[1], "connectedAt": str(r[2])}
         for r in rows
     ]
+# TEMP ADMIN VIEW (read-only)
+@app.get("/__view_tokens")
+def view_tokens():
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(text("""
+                SELECT provider, customer_id, user_email, created_at
+                FROM oauth_tokens
+                ORDER BY created_at DESC
+            """)).fetchall()
+
+        return [
+            {
+                "provider": r[0],
+                "customerId": r[1],
+                "email": r[2],
+                "connectedAt": str(r[3])
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        return {"error": str(e)}
