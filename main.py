@@ -549,3 +549,32 @@ def list_google_connections():
         """)).fetchall()
 
     return [{"customerId": r[0], "email": r[1], "connectedAt": str(r[2])} for r in rows]
+@app.post("/google/calendars/select")
+async def google_calendars_select(payload: Dict[str, Any]):
+    customer_id = payload.get("customerId")
+    selected_ids = payload.get("calendarIds")
+
+    if not customer_id or not isinstance(selected_ids, list) or not selected_ids:
+        raise HTTPException(status_code=400, detail="Send customerId and calendarIds (list).")
+
+    selected_ids = [s.strip() for s in selected_ids if isinstance(s, str) and s.strip()]
+    if not selected_ids:
+        raise HTTPException(status_code=400, detail="calendarIds must be non-empty strings.")
+
+    with engine.begin() as conn:
+        # mark all false
+        conn.execute(text("""
+            UPDATE customer_calendars
+            SET selected = FALSE
+            WHERE provider='google' AND customer_id=:customer_id
+        """), {"customer_id": customer_id})
+
+        # mark only chosen true
+        conn.execute(text("""
+            UPDATE customer_calendars
+            SET selected = TRUE
+            WHERE provider='google' AND customer_id=:customer_id
+              AND calendar_id = ANY(:ids)
+        """), {"customer_id": customer_id, "ids": selected_ids})
+
+    return {"customerId": customer_id, "selectedCalendarIds": selected_ids}
