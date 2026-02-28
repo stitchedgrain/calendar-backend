@@ -16,11 +16,12 @@ app = FastAPI()
 # -----------------------------
 # Environment variables (Render)
 # -----------------------------
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
-GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
-GOOGLE_REDIRECT_URL = os.getenv("GOOGLE_REDIRECT_URL", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
+GOOGLE_REDIRECT_URL = os.getenv("GOOGLE_REDIRECT_URL", "").strip()
 
+# Scopes
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/calendar",
     "openid",
@@ -28,12 +29,15 @@ GOOGLE_SCOPES = [
     "profile",
 ]
 
+# Google endpoints
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 
+# Google Calendar endpoints
 GOOGLE_FREEBUSY_URL = "https://www.googleapis.com/calendar/v3/freeBusy"
 GOOGLE_EVENTS_INSERT_URL = "https://www.googleapis.com/calendar/v3/calendars/{calendarId}/events"
+GOOGLE_CALENDAR_LIST_URL = "https://www.googleapis.com/calendar/v3/users/me/calendarList"
 
 engine = None
 
@@ -53,7 +57,13 @@ def require_env():
 
 
 def make_engine():
-    url = DATABASE_URL.strip()
+    """
+    Render often provides:
+      postgres://user:pass@host/db
+    SQLAlchemy prefers a driver-qualified URL:
+      postgresql+psycopg://user:pass@host/db
+    """
+    url = DATABASE_URL
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+psycopg://", 1)
     elif url.startswith("postgresql://"):
@@ -67,7 +77,7 @@ def init_db():
     engine = make_engine()
     try:
         with engine.begin() as conn:
-            # Tokens keyed by customer_id (not email)
+            # Tokens keyed by (provider, customer_id)
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS oauth_tokens (
                   provider TEXT NOT NULL,
@@ -81,12 +91,26 @@ def init_db():
                 );
             """))
 
-            # State table stores state -> customer_id mapping
+            # OAuth state -> customer_id mapping
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS oauth_states (
                   state TEXT PRIMARY KEY,
                   customer_id TEXT NOT NULL,
                   created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            """))
+
+            # Store calendars per customer; selected determines which are checked
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS customer_calendars (
+                  provider TEXT NOT NULL,
+                  customer_id TEXT NOT NULL,
+                  calendar_id TEXT NOT NULL,
+                  summary TEXT,
+                  primary_cal BOOLEAN DEFAULT FALSE,
+                  selected BOOLEAN DEFAULT TRUE,
+                  created_at TIMESTAMPTZ DEFAULT NOW(),
+                  PRIMARY KEY (provider, customer_id, calendar_id)
                 );
             """))
     except SQLAlchemyError as e:
@@ -111,9 +135,7 @@ def save_state(state: str, customer_id: str):
 
 
 def consume_state(state: str) -> Optional[str]:
-    """
-    Returns customer_id if state exists, then deletes it.
-    """
+    """Return customer_id for a state, then delete the state."""
     with engine.begin() as conn:
         row = conn.execute(
             text("SELECT customer_id FROM oauth_states WHERE state=:state"),
@@ -161,17 +183,35 @@ def load_refresh_token_by_customer(customer_id: str) -> Optional[str]:
         return row[0] if row else None
 
 
-def load_customer_email(customer_id: str) -> Optional[str]:
+def store_calendars(customer_id: str, calendars: List[Dict[str, Any]]):
     with engine.begin() as conn:
-        row = conn.execute(
-            text("""
-                SELECT user_email
-                FROM oauth_tokens
-                WHERE provider='google' AND customer_id=:customer_id
-            """),
-            {"customer_id": customer_id},
-        ).fetchone()
-        return row[0] if row else None
+        for cal in calendars:
+            cal_id = cal.get("id")
+            if not cal_id:
+                continue
+            conn.execute(text("""
+                INSERT INTO customer_calendars(provider, customer_id, calendar_id, summary, primary_cal, selected)
+                VALUES ('google', :customer_id, :calendar_id, :summary, :primary_cal, TRUE)
+                ON CONFLICT (provider, customer_id, calendar_id) DO UPDATE SET
+                  summary = EXCLUDED.summary,
+                  primary_cal = EXCLUDED.primary_cal
+            """), {
+                "customer_id": customer_id,
+                "calendar_id": cal_id,
+                "summary": cal.get("summary"),
+                "primary_cal": bool(cal.get("primary")),
+            })
+
+
+def load_selected_calendar_ids(customer_id: str) -> List[str]:
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT calendar_id
+            FROM customer_calendars
+            WHERE provider='google' AND customer_id=:customer_id AND selected=TRUE
+            ORDER BY primary_cal DESC, calendar_id ASC
+        """), {"customer_id": customer_id}).fetchall()
+    return [r[0] for r in rows]
 
 
 # -----------------------------
@@ -219,6 +259,17 @@ def get_user_email(access_token: str) -> str:
     if not email:
         raise HTTPException(status_code=400, detail="No email returned from userinfo.")
     return email
+
+
+def fetch_calendar_list(access_token: str) -> List[Dict[str, Any]]:
+    r = requests.get(
+        GOOGLE_CALENDAR_LIST_URL,
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=30,
+    )
+    if r.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"Calendar list failed: {r.text}")
+    return r.json().get("items", [])
 
 
 # -----------------------------
@@ -270,7 +321,6 @@ def google_oauth_start(customerId: str = Query(..., description="Your internal c
         "include_granted_scopes": "true",
         "state": state,
     }
-
     return RedirectResponse(f"{GOOGLE_AUTH_URL}?{urlencode(params)}")
 
 
@@ -299,6 +349,7 @@ def google_oauth_callback(code: Optional[str] = None, state: Optional[str] = Non
 
     user_email = get_user_email(access_token)
 
+    # If Google doesn't return refresh_token (already consented), we require reconnect/remove access.
     if not refresh_token:
         existing = load_refresh_token_by_customer(customer_id)
         if not existing:
@@ -314,12 +365,69 @@ def google_oauth_callback(code: Optional[str] = None, state: Optional[str] = Non
 
     upsert_refresh_token(customer_id, refresh_token, scope, token_type, user_email)
 
+    # Auto-sync calendars on connect so freebusy can be automatic
+    try:
+        calendar_items = fetch_calendar_list(access_token)
+        store_calendars(customer_id, calendar_items)
+    except Exception:
+        # Non-fatal; user can call /google/calendars/sync later
+        pass
+
     return {
         "connected": True,
         "customerId": customer_id,
         "email": user_email,
-        "message": "Google connected for this customerId. Use customerId in /google/freebusy and /google/create_event.",
+        "message": "Google connected. Calendars synced. Use /google/freebusy and /google/create_event with customerId.",
     }
+
+
+# -----------------------------
+# Calendar sync / management
+# -----------------------------
+@app.post("/google/calendars/sync")
+async def google_calendars_sync(payload: Dict[str, Any]):
+    """
+    { "customerId": "pm_1" }
+    Pull calendar list and store. (Also marks them selected=TRUE by default.)
+    """
+    require_env()
+    customer_id = payload.get("customerId")
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="Missing customerId.")
+
+    rt = load_refresh_token_by_customer(customer_id)
+    if not rt:
+        raise HTTPException(status_code=401, detail="Customer not connected. Run /oauth/google/start?customerId=...")
+
+    access_token = refresh_access_token(rt)
+    items = fetch_calendar_list(access_token)
+    store_calendars(customer_id, items)
+
+    return {"synced": len(items)}
+
+
+@app.get("/google/calendars")
+def google_calendars_list(customerId: str = Query(...)):
+    """View stored calendars for a customer (safe; no tokens)."""
+    require_env()
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT calendar_id, summary, primary_cal, selected, created_at
+            FROM customer_calendars
+            WHERE provider='google' AND customer_id=:customer_id
+            ORDER BY primary_cal DESC, summary NULLS LAST, calendar_id
+        """), {"customer_id": customerId}).fetchall()
+
+    return [
+        {
+            "calendarId": r[0],
+            "summary": r[1],
+            "primary": bool(r[2]),
+            "selected": bool(r[3]),
+            "createdAt": str(r[4]),
+        }
+        for r in rows
+    ]
 
 
 # -----------------------------
@@ -328,12 +436,23 @@ def google_oauth_callback(code: Optional[str] = None, state: Optional[str] = Non
 @app.post("/google/freebusy")
 async def google_freebusy(payload: Dict[str, Any]):
     """
+    If calendarIds is omitted, uses selected calendars from DB; falls back to ["primary"].
+
+    Body examples:
     {
-      "customerId": "pm_123",
+      "customerId": "pm_1",
       "timeMin": "2026-02-24T08:00:00-07:00",
       "timeMax": "2026-02-24T18:00:00-07:00",
+      "timeZone": "America/Denver"
+    }
+
+    Or explicitly:
+    {
+      "customerId": "pm_1",
+      "timeMin": "...",
+      "timeMax": "...",
       "timeZone": "America/Denver",
-      "calendarIds": ["primary", "some_calendar_id@group.calendar.google.com"]
+      "calendarIds": ["primary", "someone@group.calendar.google.com"]
     }
     """
     require_env()
@@ -342,16 +461,31 @@ async def google_freebusy(payload: Dict[str, Any]):
     time_min = payload.get("timeMin")
     time_max = payload.get("timeMax")
     tz = payload.get("timeZone", "America/Denver")
-    calendar_ids: List[str] = payload.get("calendarIds", ["primary"])
 
     if not customer_id or not time_min or not time_max:
         raise HTTPException(status_code=400, detail="Missing customerId/timeMin/timeMax.")
 
     rt = load_refresh_token_by_customer(customer_id)
     if not rt:
-        raise HTTPException(status_code=401, detail="Customer not connected. Run /oauth/google/start?customerId=... first.")
+        raise HTTPException(status_code=401, detail="Customer not connected. Run /oauth/google/start?customerId=...")
 
     access_token = refresh_access_token(rt)
+
+    calendar_ids = payload.get("calendarIds")
+
+    # Normalize calendarIds (protect against Make sending a string)
+    if calendar_ids is None:
+        calendar_ids = []
+    elif isinstance(calendar_ids, str):
+        calendar_ids = [calendar_ids]
+    elif not isinstance(calendar_ids, list):
+        raise HTTPException(status_code=400, detail="calendarIds must be a list of strings or a single string.")
+
+    calendar_ids = [cid.strip() for cid in calendar_ids if isinstance(cid, str) and cid.strip()]
+
+    # If not provided, use stored selected calendars; fallback to primary
+    if not calendar_ids:
+        calendar_ids = load_selected_calendar_ids(customer_id) or ["primary"]
 
     body = {
         "timeMin": time_min,
@@ -376,7 +510,7 @@ async def google_freebusy(payload: Dict[str, Any]):
 async def google_create_event(payload: Dict[str, Any]):
     """
     {
-      "customerId": "pm_123",
+      "customerId": "pm_1",
       "calendarId": "primary",
       "summary": "Maintenance visit",
       "description": "Fix sink",
@@ -395,7 +529,7 @@ async def google_create_event(payload: Dict[str, Any]):
 
     rt = load_refresh_token_by_customer(customer_id)
     if not rt:
-        raise HTTPException(status_code=401, detail="Customer not connected. Run /oauth/google/start?customerId=... first.")
+        raise HTTPException(status_code=401, detail="Customer not connected. Run /oauth/google/start?customerId=...")
 
     access_token = refresh_access_token(rt)
     url = GOOGLE_EVENTS_INSERT_URL.format(calendarId=calendar_id)
@@ -426,7 +560,9 @@ async def google_create_event(payload: Dict[str, Any]):
     return r.json()
 
 
-# Optional helper endpoint (safe): list connected customers
+# -----------------------------
+# Safe helper: list connected customers
+# -----------------------------
 @app.get("/connections/google")
 def list_google_connections():
     require_env()
@@ -439,29 +575,4 @@ def list_google_connections():
             LIMIT 200
         """)).fetchall()
 
-    return [
-        {"customerId": r[0], "email": r[1], "connectedAt": str(r[2])}
-        for r in rows
-    ]
-# TEMP ADMIN VIEW (read-only)
-@app.get("/__view_tokens")
-def view_tokens():
-    try:
-        with engine.begin() as conn:
-            rows = conn.execute(text("""
-                SELECT provider, customer_id, user_email, created_at
-                FROM oauth_tokens
-                ORDER BY created_at DESC
-            """)).fetchall()
-
-        return [
-            {
-                "provider": r[0],
-                "customerId": r[1],
-                "email": r[2],
-                "connectedAt": str(r[3])
-            }
-            for r in rows
-        ]
-    except Exception as e:
-        return {"error": str(e)}
+    return [{"customerId": r[0], "email": r[1], "connectedAt": str(r[2])} for r in rows]
