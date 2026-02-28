@@ -577,6 +577,15 @@ def list_google_connections():
         """)).fetchall()
 
     return [{"customerId": r[0], "email": r[1], "connectedAt": str(r[2])} for r in rows]
+    def validate_rfc3339(dt: str):
+    try:
+        # Accept Z or offset
+        if dt.endswith("Z"):
+            datetime.fromisoformat(dt.replace("Z", "+00:00"))
+        else:
+            datetime.fromisoformat(dt)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Invalid RFC3339 datetime: {dt}")
 @app.post("/google/freebusy_debug")
 async def google_freebusy_debug(payload: Dict[str, Any]):
     require_env()
