@@ -576,3 +576,55 @@ def list_google_connections():
         """)).fetchall()
 
     return [{"customerId": r[0], "email": r[1], "connectedAt": str(r[2])} for r in rows]
+@app.post("/google/freebusy_debug")
+async def google_freebusy_debug(payload: Dict[str, Any]):
+    require_env()
+
+    customer_id = payload.get("customerId")
+    time_min = payload.get("timeMin")
+    time_max = payload.get("timeMax")
+    tz = payload.get("timeZone", "America/Denver")
+
+    if not customer_id or not time_min or not time_max:
+        raise HTTPException(status_code=400, detail="Missing customerId/timeMin/timeMax.")
+
+    rt = load_refresh_token_by_customer(customer_id)
+    if not rt:
+        raise HTTPException(status_code=401, detail="Customer not connected.")
+
+    access_token = refresh_access_token(rt)
+
+    calendar_ids = payload.get("calendarIds")
+
+    # Normalize
+    if calendar_ids is None:
+        calendar_ids = []
+    elif isinstance(calendar_ids, str):
+        calendar_ids = [calendar_ids]
+    elif not isinstance(calendar_ids, list):
+        raise HTTPException(status_code=400, detail="calendarIds must be a list of strings or a single string.")
+
+    calendar_ids = [cid.strip() for cid in calendar_ids if isinstance(cid, str) and cid.strip()]
+    if not calendar_ids:
+        calendar_ids = load_selected_calendar_ids(customer_id) or ["primary"]
+
+    google_body = {
+        "timeMin": time_min,
+        "timeMax": time_max,
+        "timeZone": tz,
+        "items": [{"id": cid} for cid in calendar_ids],
+    }
+
+    # Call Google
+    r = requests.post(
+        GOOGLE_FREEBUSY_URL,
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+        data=json.dumps(google_body),
+        timeout=30,
+    )
+
+    return {
+        "sent_to_google": google_body,
+        "google_status": r.status_code,
+        "google_response_text": r.text,
+    }
