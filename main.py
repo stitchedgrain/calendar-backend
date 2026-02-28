@@ -587,3 +587,37 @@ async def google_calendars_select(payload: Dict[str, Any]):
         """), {"customer_id": customer_id, "ids": selected_ids})
 
     return {"customerId": customer_id, "selectedCalendarIds": selected_ids}
+@app.post("/customer/settings")
+async def set_customer_settings(payload: Dict[str, Any]):
+    require_env()
+
+    customer_id = payload.get("customerId")
+    timezone_name = payload.get("timeZone", "America/Denver")
+    work_start = int(payload.get("workStartHour", 9))
+    work_end = int(payload.get("workEndHour", 17))
+    work_days = payload.get("workDays", [1,2,3,4,5])
+
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="Missing customerId.")
+
+    days_str = ",".join(str(d) for d in work_days)
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+        INSERT INTO customer_settings(customer_id, timezone, work_start_hour, work_end_hour, work_days)
+        VALUES (:cid, :tz, :ws, :we, :wd)
+        ON CONFLICT (customer_id)
+        DO UPDATE SET
+          timezone=:tz,
+          work_start_hour=:ws,
+          work_end_hour=:we,
+          work_days=:wd
+        """), {
+            "cid": customer_id,
+            "tz": timezone_name,
+            "ws": work_start,
+            "we": work_end,
+            "wd": days_str
+        })
+
+    return {"customerId": customer_id, "saved": True}
