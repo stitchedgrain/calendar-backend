@@ -131,7 +131,16 @@ def init_db():
 
 
 init_db()
-
+conn.execute(text("""
+CREATE TABLE IF NOT EXISTS customer_settings (
+  customer_id TEXT PRIMARY KEY,
+  timezone TEXT NOT NULL DEFAULT 'America/Denver',
+  work_start_hour INTEGER NOT NULL DEFAULT 9,
+  work_end_hour INTEGER NOT NULL DEFAULT 17,
+  work_days TEXT NOT NULL DEFAULT '1,2,3,4,5',
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+"""))
 
 # -----------------------------
 # DB HELPERS
