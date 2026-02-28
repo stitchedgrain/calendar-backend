@@ -3,14 +3,13 @@ import json
 import secrets
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlencode
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import RedirectResponse, JSONResponse
-
+from fastapi.responses import RedirectResponse
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError
 
 app = FastAPI()
 
@@ -41,7 +40,7 @@ engine = None
 
 
 # -----------------------------
-# UTIL
+# CORE UTIL
 # -----------------------------
 def require_env():
     missing = []
@@ -59,6 +58,7 @@ def require_env():
 
 def make_engine():
     url = DATABASE_URL
+    # Render often provides postgres:// ; SQLAlchemy prefers postgresql+psycopg://
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+psycopg://", 1)
     elif url.startswith("postgresql://"):
@@ -66,22 +66,74 @@ def make_engine():
     return create_engine(url, pool_pre_ping=True)
 
 
-def validate_rfc3339(dt: str):
-    """
-    Validates RFC3339-ish datetimes.
-    Accepts:
-      - 2026-02-28T15:00:00Z
-      - 2026-02-28T15:00:00-07:00
-      - 2026-02-28T15:00:00+00:00
-    """
-    try:
-        dt2 = dt.strip()
-        if dt2.endswith("Z"):
-            datetime.fromisoformat(dt2.replace("Z", "+00:00"))
+def parse_iso_to_utc(s: str) -> datetime:
+    dt = datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        raise HTTPException(status_code=400, detail=f"Datetime missing timezone/offset: {s}")
+    return dt.astimezone(timezone.utc)
+
+
+def iso_z(dt_utc: datetime) -> str:
+    return dt_utc.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def merge_intervals(intervals: List[Dict[str, datetime]]) -> List[Dict[str, datetime]]:
+    if not intervals:
+        return []
+    intervals = sorted(intervals, key=lambda x: x["start"])
+    merged = [intervals[0]]
+    for cur in intervals[1:]:
+        last = merged[-1]
+        if cur["start"] <= last["end"]:  # overlap or touch
+            if cur["end"] > last["end"]:
+                last["end"] = cur["end"]
         else:
-            datetime.fromisoformat(dt2)
-    except Exception:
-        raise HTTPException(status_code=400, detail=f"Invalid RFC3339 datetime: {dt}")
+            merged.append(cur)
+    return merged
+
+
+def subtract_busy_from_window(win_start: datetime, win_end: datetime, busy: List[Dict[str, datetime]]) -> List[Dict[str, datetime]]:
+    free = []
+    cursor = win_start
+    for b in busy:
+        if b["end"] <= cursor:
+            continue
+        if b["start"] >= win_end:
+            break
+        if b["start"] > cursor:
+            free.append({"start": cursor, "end": min(b["start"], win_end)})
+        cursor = max(cursor, b["end"])
+        if cursor >= win_end:
+            break
+    if cursor < win_end:
+        free.append({"start": cursor, "end": win_end})
+    return [f for f in free if f["end"] > f["start"]]
+
+
+def round_up_to_step(dt_utc: datetime, step_minutes: int) -> datetime:
+    step = step_minutes * 60
+    ts = int(dt_utc.timestamp())
+    rounded = ((ts + step - 1) // step) * step
+    return datetime.fromtimestamp(rounded, tz=timezone.utc)
+
+
+def format_local(dt_utc: datetime, tz: ZoneInfo) -> str:
+    return dt_utc.astimezone(tz).strftime("%a %b %d, %Y %I:%M %p %Z")
+
+
+def weekday_name_to_int(name: str) -> Optional[int]:
+    m = {
+        "monday": 0, "mon": 0,
+        "tuesday": 1, "tue": 1, "tues": 1,
+        "wednesday": 2, "wed": 2,
+        "thursday": 3, "thu": 3, "thur": 3, "thurs": 3,
+        "friday": 4, "fri": 4,
+        "saturday": 5, "sat": 5,
+        "sunday": 6, "sun": 6,
+    }
+    if not name:
+        return None
+    return m.get(name.strip().lower())
 
 
 # -----------------------------
@@ -91,56 +143,57 @@ def init_db():
     global engine
     require_env()
     engine = make_engine()
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS oauth_tokens (
-                  provider TEXT NOT NULL,
-                  customer_id TEXT NOT NULL,
-                  user_email TEXT,
-                  refresh_token TEXT NOT NULL,
-                  scope TEXT,
-                  token_type TEXT,
-                  created_at TIMESTAMPTZ DEFAULT NOW(),
-                  PRIMARY KEY (provider, customer_id)
-                );
-            """))
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS oauth_tokens (
+              provider TEXT NOT NULL,
+              customer_id TEXT NOT NULL,
+              user_email TEXT,
+              refresh_token TEXT NOT NULL,
+              scope TEXT,
+              token_type TEXT,
+              created_at TIMESTAMPTZ DEFAULT NOW(),
+              PRIMARY KEY (provider, customer_id)
+            );
+        """))
 
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS oauth_states (
-                  state TEXT PRIMARY KEY,
-                  customer_id TEXT NOT NULL,
-                  created_at TIMESTAMPTZ DEFAULT NOW()
-                );
-            """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS oauth_states (
+              state TEXT PRIMARY KEY,
+              customer_id TEXT NOT NULL,
+              created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """))
 
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS customer_calendars (
-                  provider TEXT NOT NULL,
-                  customer_id TEXT NOT NULL,
-                  calendar_id TEXT NOT NULL,
-                  summary TEXT,
-                  primary_cal BOOLEAN DEFAULT FALSE,
-                  selected BOOLEAN DEFAULT TRUE,
-                  created_at TIMESTAMPTZ DEFAULT NOW(),
-                  PRIMARY KEY (provider, customer_id, calendar_id)
-                );
-            """))
-    except SQLAlchemyError as e:
-        raise RuntimeError(f"DB init failed: {e}") from e
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS customer_calendars (
+              provider TEXT NOT NULL,
+              customer_id TEXT NOT NULL,
+              calendar_id TEXT NOT NULL,
+              summary TEXT,
+              access_role TEXT,
+              primary_cal BOOLEAN DEFAULT FALSE,
+              selected BOOLEAN DEFAULT TRUE,
+              created_at TIMESTAMPTZ DEFAULT NOW(),
+              PRIMARY KEY (provider, customer_id, calendar_id)
+            );
+        """))
+
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS customer_settings (
+              customer_id TEXT PRIMARY KEY,
+              timezone TEXT NOT NULL DEFAULT 'America/Denver',
+              work_start_hour INTEGER NOT NULL DEFAULT 9,
+              work_end_hour INTEGER NOT NULL DEFAULT 17,
+              work_days TEXT NOT NULL DEFAULT '0,1,2,3,4', -- Mon-Fri in Python weekday ints
+              created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """))
 
 
+# Run init on import (Render boot)
 init_db()
-conn.execute(text("""
-CREATE TABLE IF NOT EXISTS customer_settings (
-  customer_id TEXT PRIMARY KEY,
-  timezone TEXT NOT NULL DEFAULT 'America/Denver',
-  work_start_hour INTEGER NOT NULL DEFAULT 9,
-  work_end_hour INTEGER NOT NULL DEFAULT 17,
-  work_days TEXT NOT NULL DEFAULT '1,2,3,4,5',
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-"""))
+
 
 # -----------------------------
 # DB HELPERS
@@ -192,7 +245,7 @@ def upsert_refresh_token(customer_id: str, refresh_token: str, scope: str, token
         )
 
 
-def load_refresh_token_by_customer(customer_id: str) -> Optional[str]:
+def load_refresh_token(customer_id: str) -> Optional[str]:
     with engine.begin() as conn:
         row = conn.execute(
             text("""
@@ -212,15 +265,17 @@ def store_calendars(customer_id: str, calendars: List[Dict[str, Any]]):
             if not cal_id:
                 continue
             conn.execute(text("""
-                INSERT INTO customer_calendars(provider, customer_id, calendar_id, summary, primary_cal, selected)
-                VALUES ('google', :customer_id, :calendar_id, :summary, :primary_cal, TRUE)
+                INSERT INTO customer_calendars(provider, customer_id, calendar_id, summary, access_role, primary_cal, selected)
+                VALUES ('google', :customer_id, :calendar_id, :summary, :access_role, :primary_cal, TRUE)
                 ON CONFLICT (provider, customer_id, calendar_id) DO UPDATE SET
                   summary = EXCLUDED.summary,
+                  access_role = EXCLUDED.access_role,
                   primary_cal = EXCLUDED.primary_cal
             """), {
                 "customer_id": customer_id,
                 "calendar_id": cal_id,
                 "summary": cal.get("summary"),
+                "access_role": cal.get("accessRole"),
                 "primary_cal": bool(cal.get("primary")),
             })
 
@@ -234,6 +289,52 @@ def load_selected_calendar_ids(customer_id: str) -> List[str]:
             ORDER BY primary_cal DESC, calendar_id ASC
         """), {"customer_id": customer_id}).fetchall()
     return [r[0] for r in rows]
+
+
+def get_customer_settings(customer_id: str) -> Dict[str, Any]:
+    with engine.begin() as conn:
+        row = conn.execute(text("""
+            SELECT timezone, work_start_hour, work_end_hour, work_days
+            FROM customer_settings
+            WHERE customer_id=:cid
+        """), {"cid": customer_id}).fetchone()
+
+    if not row:
+        # defaults
+        return {
+            "timezone": "America/Denver",
+            "work_start_hour": 9,
+            "work_end_hour": 17,
+            "work_days": [0, 1, 2, 3, 4],
+        }
+
+    tz_name, ws, we, days_str = row
+    days = []
+    try:
+        days = [int(x.strip()) for x in (days_str or "").split(",") if x.strip() != ""]
+    except Exception:
+        days = [0, 1, 2, 3, 4]
+
+    return {
+        "timezone": tz_name or "America/Denver",
+        "work_start_hour": int(ws),
+        "work_end_hour": int(we),
+        "work_days": days if days else [0, 1, 2, 3, 4],
+    }
+
+
+def set_customer_settings_db(customer_id: str, tz_name: str, ws: int, we: int, days: List[int]):
+    days_str = ",".join(str(int(d)) for d in days)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO customer_settings(customer_id, timezone, work_start_hour, work_end_hour, work_days)
+            VALUES (:cid, :tz, :ws, :we, :wd)
+            ON CONFLICT (customer_id) DO UPDATE SET
+              timezone = EXCLUDED.timezone,
+              work_start_hour = EXCLUDED.work_start_hour,
+              work_end_hour = EXCLUDED.work_end_hour,
+              work_days = EXCLUDED.work_days
+        """), {"cid": customer_id, "tz": tz_name, "ws": ws, "we": we, "wd": days_str})
 
 
 # -----------------------------
@@ -264,17 +365,14 @@ def refresh_access_token(refresh_token: str) -> str:
     if r.status_code != 200:
         raise HTTPException(status_code=400, detail=f"Token refresh failed: {r.text}")
     data = r.json()
-    if "access_token" not in data:
+    token = data.get("access_token")
+    if not token:
         raise HTTPException(status_code=400, detail=f"Token refresh returned no access_token: {data}")
-    return data["access_token"]
+    return token
 
 
 def get_user_email(access_token: str) -> str:
-    r = requests.get(
-        GOOGLE_USERINFO_URL,
-        headers={"Authorization": f"Bearer {access_token}"},
-        timeout=30,
-    )
+    r = requests.get(GOOGLE_USERINFO_URL, headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
     if r.status_code != 200:
         raise HTTPException(status_code=400, detail=f"Failed to fetch userinfo: {r.text}")
     email = r.json().get("email")
@@ -284,11 +382,7 @@ def get_user_email(access_token: str) -> str:
 
 
 def fetch_calendar_list(access_token: str) -> List[Dict[str, Any]]:
-    r = requests.get(
-        GOOGLE_CALENDAR_LIST_URL,
-        headers={"Authorization": f"Bearer {access_token}"},
-        timeout=30,
-    )
+    r = requests.get(GOOGLE_CALENDAR_LIST_URL, headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
     if r.status_code != 200:
         raise HTTPException(status_code=400, detail=f"Calendar list failed: {r.text}")
     return r.json().get("items", [])
@@ -299,31 +393,50 @@ def fetch_calendar_list(access_token: str) -> List[Dict[str, Any]]:
 # -----------------------------
 @app.get("/")
 def root():
-    return {"status": "server is alive"}
-
+    return {"status": "alive"}
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
-@app.get("/privacy")
-def privacy():
-    return {"policy": "This app reads availability and creates bookings you request. We do not sell data."}
+# -----------------------------
+# CUSTOMER SETTINGS
+# -----------------------------
+@app.post("/customer/settings")
+async def set_customer_settings(payload: Dict[str, Any]):
+    require_env()
 
+    customer_id = payload.get("customerId")
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="Missing customerId.")
 
-@app.get("/terms")
-def terms():
-    return {"terms": "By using this service you authorize reading availability and creating/updating events on your behalf."}
+    tz_name = payload.get("timeZone", "America/Denver")
+    ws = int(payload.get("workStartHour", 9))
+    we = int(payload.get("workEndHour", 17))
+    days = payload.get("workDays", [0, 1, 2, 3, 4])
+
+    if ws < 0 or ws > 23 or we < 1 or we > 24 or we <= ws:
+        raise HTTPException(status_code=400, detail="Invalid working hours. Example: start 9 end 17.")
+
+    if not isinstance(days, list) or not all(isinstance(d, int) for d in days):
+        raise HTTPException(status_code=400, detail="workDays must be a list of ints (Mon=0..Sun=6).")
+
+    try:
+        ZoneInfo(tz_name)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Invalid timeZone: {tz_name}")
+
+    set_customer_settings_db(customer_id, tz_name, ws, we, days)
+    return {"customerId": customer_id, "saved": True}
 
 
 # -----------------------------
 # OAUTH
 # -----------------------------
 @app.get("/oauth/google/start")
-def google_oauth_start(customerId: str = Query(..., description="Your internal customer/location id")):
+def google_oauth_start(customerId: str = Query(...)):
     require_env()
-
     state = secrets.token_urlsafe(24)
     save_state(state, customerId)
 
@@ -364,39 +477,60 @@ def google_oauth_callback(code: Optional[str] = None, state: Optional[str] = Non
 
     user_email = get_user_email(access_token)
 
+    # If Google didn't return refresh_token, keep existing if present
     if not refresh_token:
-        existing = load_refresh_token_by_customer(customer_id)
+        existing = load_refresh_token(customer_id)
         if not existing:
-            return JSONResponse(
-                {
-                    "connected": False,
-                    "customerId": customer_id,
-                    "email": user_email,
-                    "message": "No refresh token returned. Remove app access in Google Account and try again.",
-                }
+            raise HTTPException(
+                status_code=400,
+                detail="No refresh token returned. Remove app access in Google Account then reconnect.",
             )
         refresh_token = existing
 
     upsert_refresh_token(customer_id, refresh_token, scope, token_type, user_email)
 
-    # auto-sync calendars for automatic freebusy
-    try:
-        calendars = fetch_calendar_list(access_token)
-        store_calendars(customer_id, calendars)
-    except Exception:
-        pass
+    # Sync calendars immediately
+    calendars = fetch_calendar_list(access_token)
+    store_calendars(customer_id, calendars)
+
+    # Create default settings row if not exists (optional)
+    s = get_customer_settings(customer_id)
+    set_customer_settings_db(customer_id, s["timezone"], s["work_start_hour"], s["work_end_hour"], s["work_days"])
 
     return {
         "connected": True,
         "customerId": customer_id,
         "email": user_email,
-        "message": "Google connected. Calendars synced. Use /google/freebusy and /google/create_event with customerId.",
+        "message": "Google connected and calendars synced. Use /google/calendars then /google/calendars/select, then /google/availability.",
     }
 
 
 # -----------------------------
-# CALENDAR SYNC / VIEW
+# CALENDAR LIST / SYNC / SELECT
 # -----------------------------
+@app.get("/google/calendars")
+def google_calendars(customerId: str = Query(...)):
+    require_env()
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT calendar_id, summary, access_role, primary_cal, selected
+            FROM customer_calendars
+            WHERE provider='google' AND customer_id=:cid
+            ORDER BY primary_cal DESC, summary NULLS LAST, calendar_id
+        """), {"cid": customerId}).fetchall()
+
+    return [
+        {
+            "calendarId": r[0],
+            "summary": r[1],
+            "accessRole": r[2],
+            "primary": bool(r[3]),
+            "selected": bool(r[4]),
+        }
+        for r in rows
+    ]
+
+
 @app.post("/google/calendars/sync")
 async def google_calendars_sync(payload: Dict[str, Any]):
     require_env()
@@ -404,7 +538,7 @@ async def google_calendars_sync(payload: Dict[str, Any]):
     if not customer_id:
         raise HTTPException(status_code=400, detail="Missing customerId.")
 
-    rt = load_refresh_token_by_customer(customer_id)
+    rt = load_refresh_token(customer_id)
     if not rt:
         raise HTTPException(status_code=401, detail="Customer not connected. Run /oauth/google/start?customerId=...")
 
@@ -414,57 +548,107 @@ async def google_calendars_sync(payload: Dict[str, Any]):
     return {"synced": len(calendars)}
 
 
-@app.get("/google/calendars")
-def google_calendars_list(customerId: str = Query(...)):
+@app.post("/google/calendars/select")
+async def google_calendars_select(payload: Dict[str, Any]):
     require_env()
-    with engine.begin() as conn:
-        rows = conn.execute(text("""
-            SELECT calendar_id, summary, primary_cal, selected, created_at
-            FROM customer_calendars
-            WHERE provider='google' AND customer_id=:customer_id
-            ORDER BY primary_cal DESC, summary NULLS LAST, calendar_id
-        """), {"customer_id": customerId}).fetchall()
-
-    return [
-        {
-            "calendarId": r[0],
-            "summary": r[1],
-            "primary": bool(r[2]),
-            "selected": bool(r[3]),
-            "createdAt": str(r[4]),
-        }
-        for r in rows
-    ]
-
-
-# -----------------------------
-# FREEBUSY
-# -----------------------------
-@app.post("/google/freebusy")
-async def google_freebusy(payload: Dict[str, Any]):
-    require_env()
-
     customer_id = payload.get("customerId")
-    time_min = payload.get("timeMin")
-    time_max = payload.get("timeMax")
-    tz = payload.get("timeZone", "America/Denver")
+    calendar_ids = payload.get("calendarIds")
 
-    if not customer_id or not time_min or not time_max:
-        raise HTTPException(status_code=400, detail="Missing customerId/timeMin/timeMax.")
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="Missing customerId.")
+    if not isinstance(calendar_ids, list):
+        raise HTTPException(status_code=400, detail="calendarIds must be a list of strings.")
+    calendar_ids = [c.strip() for c in calendar_ids if isinstance(c, str) and c.strip()]
+    if not calendar_ids:
+        raise HTTPException(status_code=400, detail="calendarIds must contain at least one id.")
 
-    # Validate times early (catches bad dates like Feb 29 on non-leap years)
-    validate_rfc3339(time_min)
-    validate_rfc3339(time_max)
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE customer_calendars
+            SET selected = FALSE
+            WHERE provider='google' AND customer_id=:cid
+        """), {"cid": customer_id})
 
-    rt = load_refresh_token_by_customer(customer_id)
+        for cid in calendar_ids:
+            conn.execute(text("""
+                UPDATE customer_calendars
+                SET selected = TRUE
+                WHERE provider='google' AND customer_id=:cid AND calendar_id=:calid
+            """), {"cid": customer_id, "calid": cid})
+
+    return {"customerId": customer_id, "selectedCalendarIds": calendar_ids}
+
+
+# -----------------------------
+# AVAILABILITY (DST SAFE, ANY TIMEZONE)
+# -----------------------------
+@app.post("/google/availability")
+async def google_availability(payload: Dict[str, Any]):
+    """
+    Returns:
+      - merged busy blocks across selected calendars
+      - candidate slots (30min step default) for next 7 days (default)
+      - optional preference filtering + suggestions (3 default)
+
+    Request example:
+    {
+      "customerId": "pm_1",
+      "durationMinutes": 60,
+      "days": 7,
+      "stepMinutes": 30,
+      "preference": {
+        "type": "closest" | "weekday" | "datetime",
+        "weekday": "tuesday",
+        "preferredStart": "2026-03-03T14:00:00-07:00",
+        "timeOfDay": "morning" | "afternoon",
+        "strategy": "spread" | "closest",
+        "maxResults": 3
+      }
+    }
+    """
+    require_env()
+    customer_id = payload.get("customerId")
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="Missing customerId.")
+
+    duration_minutes = int(payload.get("durationMinutes", 60))
+    if duration_minutes <= 0:
+        raise HTTPException(status_code=400, detail="durationMinutes must be > 0.")
+
+    days = int(payload.get("days", 7))
+    if days <= 0 or days > 31:
+        raise HTTPException(status_code=400, detail="days must be 1..31.")
+
+    step_minutes = int(payload.get("stepMinutes", 30))
+    if step_minutes <= 0:
+        raise HTTPException(status_code=400, detail="stepMinutes must be > 0.")
+
+    rt = load_refresh_token(customer_id)
     if not rt:
         raise HTTPException(status_code=401, detail="Customer not connected. Run /oauth/google/start?customerId=...")
+
+    settings = get_customer_settings(customer_id)
+
+    # Allow optional overrides in request (useful during testing)
+    tz_name = payload.get("timeZone", settings["timezone"])
+    work_start = int(payload.get("workStartHour", settings["work_start_hour"]))
+    work_end = int(payload.get("workEndHour", settings["work_end_hour"]))
+    work_days = payload.get("workDays", settings["work_days"])
+
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Invalid timeZone: {tz_name}")
+
+    if work_end <= work_start:
+        raise HTTPException(status_code=400, detail="workEndHour must be > workStartHour.")
+
+    if not isinstance(work_days, list) or not all(isinstance(d, int) and 0 <= d <= 6 for d in work_days):
+        raise HTTPException(status_code=400, detail="workDays must be list of ints 0..6 (Mon=0..Sun=6).")
 
     access_token = refresh_access_token(rt)
 
     calendar_ids = payload.get("calendarIds")
-
-    # Normalize calendarIds (Make sometimes sends a string)
     if calendar_ids is None:
         calendar_ids = []
     elif isinstance(calendar_ids, str):
@@ -473,15 +657,21 @@ async def google_freebusy(payload: Dict[str, Any]):
         raise HTTPException(status_code=400, detail="calendarIds must be a list of strings or a single string.")
 
     calendar_ids = [cid.strip() for cid in calendar_ids if isinstance(cid, str) and cid.strip()]
-
-    # If not provided, use stored selected calendars; fallback to primary
     if not calendar_ids:
         calendar_ids = load_selected_calendar_ids(customer_id) or ["primary"]
 
+    # Overall window: now -> now+days in LOCAL time (DST-safe)
+    now_local = datetime.now(tz).replace(second=0, microsecond=0)
+    start_local = now_local
+    end_local = (start_local + timedelta(days=days)).replace(second=0, microsecond=0)
+
+    time_min_utc = start_local.astimezone(timezone.utc)
+    time_max_utc = end_local.astimezone(timezone.utc)
+
     google_body = {
-        "timeMin": time_min.strip(),
-        "timeMax": time_max.strip(),
-        "timeZone": tz,
+        "timeMin": iso_z(time_min_utc),
+        "timeMax": iso_z(time_max_utc),
+        "timeZone": tz_name,
         "items": [{"id": cid} for cid in calendar_ids],
     }
 
@@ -494,7 +684,167 @@ async def google_freebusy(payload: Dict[str, Any]):
     if r.status_code != 200:
         raise HTTPException(status_code=400, detail=f"FreeBusy failed: {r.text}")
 
-    return r.json()
+    fb = r.json()
+    calendars_obj = fb.get("calendars", {})
+
+    # Collect busy intervals across calendars -> UTC
+    busy_intervals = []
+    for _, info in calendars_obj.items():
+        for b in info.get("busy", []):
+            s = b.get("start")
+            e = b.get("end")
+            if not s or not e:
+                continue
+            s_utc = parse_iso_to_utc(s)
+            e_utc = parse_iso_to_utc(e)
+            if e_utc > s_utc:
+                busy_intervals.append({"start": s_utc, "end": e_utc})
+
+    busy_merged = merge_intervals(busy_intervals)
+
+    # Build working windows day-by-day in LOCAL, convert to UTC, subtract busy, generate slots
+    dur = timedelta(minutes=duration_minutes)
+    step = timedelta(minutes=step_minutes)
+
+    available = []
+    cur_day = start_local.date()
+    last_day = end_local.date()
+
+    while cur_day < last_day:
+        day0_local = datetime(cur_day.year, cur_day.month, cur_day.day, 0, 0, tzinfo=tz)
+        weekday = day0_local.weekday()  # Mon=0..Sun=6
+
+        if weekday in work_days:
+            win_start_local = day0_local.replace(hour=work_start, minute=0)
+            win_end_local = day0_local.replace(hour=work_end, minute=0)
+
+            if win_end_local > start_local and win_start_local < end_local:
+                win_start_local = max(win_start_local, start_local)
+                win_end_local = min(win_end_local, end_local)
+
+                win_start_utc = win_start_local.astimezone(timezone.utc)
+                win_end_utc = win_end_local.astimezone(timezone.utc)
+
+                free_intervals = subtract_busy_from_window(win_start_utc, win_end_utc, busy_merged)
+
+                for fi in free_intervals:
+                    s = round_up_to_step(fi["start"], step_minutes)
+                    while s + dur <= fi["end"]:
+                        e = s + dur
+                        available.append({
+                            "startUtc": iso_z(s),
+                            "endUtc": iso_z(e),
+                            "startLocal": format_local(s, tz),
+                            "endLocal": format_local(e, tz),
+                            "weekdayLocal": s.astimezone(tz).weekday(),
+                            "hourLocal": s.astimezone(tz).hour,
+                        })
+                        s = s + step
+
+        cur_day = (day0_local + timedelta(days=1)).date()
+
+    # -----------------------------
+    # Preference Filtering + Suggestions
+    # -----------------------------
+    pref = payload.get("preference") or {}
+    max_results = int(pref.get("maxResults", 3))
+    if max_results <= 0:
+        max_results = 3
+
+    time_of_day = (pref.get("timeOfDay") or "").strip().lower()  # morning/afternoon/empty
+    def tod_ok(slot: Dict[str, Any]) -> bool:
+        if not time_of_day:
+            return True
+        h = int(slot["hourLocal"])
+        # morning: <12, afternoon: >=12 (within work hours already)
+        if time_of_day == "morning":
+            return h < 12
+        if time_of_day == "afternoon":
+            return h >= 12
+        return True
+
+    filtered = [s for s in available if tod_ok(s)]
+
+    pref_type = (pref.get("type") or "").strip().lower()
+
+    # Weekday filter like "tuesday"
+    if pref_type == "weekday":
+        wd = weekday_name_to_int(pref.get("weekday") or "")
+        if wd is not None:
+            filtered = [s for s in filtered if int(s["weekdayLocal"]) == wd]
+
+        # Spread strategy: morning, midday, late afternoon
+        strategy = (pref.get("strategy") or "spread").strip().lower()
+        if strategy == "spread":
+            buckets = {"morning": [], "midday": [], "late": []}
+            for s in filtered:
+                h = int(s["hourLocal"])
+                if h < 12:
+                    buckets["morning"].append(s)
+                elif h < 15:
+                    buckets["midday"].append(s)
+                else:
+                    buckets["late"].append(s)
+
+            suggestions = []
+            for key in ["morning", "midday", "late"]:
+                if buckets[key]:
+                    suggestions.append(buckets[key][0])
+                if len(suggestions) >= max_results:
+                    break
+
+            # If not enough, fill from remaining chronological
+            if len(suggestions) < max_results:
+                seen = set((x["startUtc"], x["endUtc"]) for x in suggestions)
+                for s in filtered:
+                    k = (s["startUtc"], s["endUtc"])
+                    if k in seen:
+                        continue
+                    suggestions.append(s)
+                    if len(suggestions) >= max_results:
+                        break
+        else:
+            # closest = first N on that weekday
+            suggestions = filtered[:max_results]
+
+    elif pref_type == "datetime":
+        # Choose closest to a preferredStart datetime (timezone-aware input required)
+        pref_start = pref.get("preferredStart")
+        if not pref_start:
+            suggestions = filtered[:max_results]
+        else:
+            preferred_utc = parse_iso_to_utc(pref_start)
+            def dist(slot: Dict[str, Any]) -> int:
+                s_utc = parse_iso_to_utc(slot["startUtc"])
+                return abs(int((s_utc - preferred_utc).total_seconds()))
+            filtered_sorted = sorted(filtered, key=dist)
+            suggestions = filtered_sorted[:max_results]
+
+    else:
+        # default / closest
+        suggestions = filtered[:max_results]
+
+    # Remove helper fields from output
+    def strip(slot: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "startUtc": slot["startUtc"],
+            "endUtc": slot["endUtc"],
+            "startLocal": slot["startLocal"],
+            "endLocal": slot["endLocal"],
+        }
+
+    return {
+        "customerId": customer_id,
+        "timeZone": tz_name,
+        "workHours": {"startHour": work_start, "endHour": work_end, "days": work_days},
+        "days": days,
+        "durationMinutes": duration_minutes,
+        "stepMinutes": step_minutes,
+        "calendarIdsUsed": calendar_ids,
+        "availableCount": len(available),
+        "suggestions": [strip(s) for s in suggestions],
+        "available": [strip(s) for s in available[:500]],  # cap
+    }
 
 
 # -----------------------------
@@ -505,26 +855,29 @@ async def google_create_event(payload: Dict[str, Any]):
     require_env()
 
     customer_id = payload.get("customerId")
-    calendar_id = payload.get("calendarId", "primary")
-
     if not customer_id:
         raise HTTPException(status_code=400, detail="Missing customerId.")
 
-    rt = load_refresh_token_by_customer(customer_id)
+    rt = load_refresh_token(customer_id)
     if not rt:
         raise HTTPException(status_code=401, detail="Customer not connected. Run /oauth/google/start?customerId=...")
 
     access_token = refresh_access_token(rt)
+
+    calendar_id = payload.get("calendarId", "primary")
     url = GOOGLE_EVENTS_INSERT_URL.format(calendarId=calendar_id)
+
+    start_obj = payload.get("start")
+    end_obj = payload.get("end")
+    if not start_obj or not end_obj:
+        raise HTTPException(status_code=400, detail="Missing start/end objects.")
 
     event_body = {
         "summary": payload.get("summary", "Booking"),
         "description": payload.get("description", ""),
-        "start": payload.get("start"),
-        "end": payload.get("end"),
+        "start": start_obj,
+        "end": end_obj,
     }
-    if not event_body["start"] or not event_body["end"]:
-        raise HTTPException(status_code=400, detail="Missing start/end in payload.")
 
     attendees = payload.get("attendees")
     if attendees:
@@ -540,84 +893,3 @@ async def google_create_event(payload: Dict[str, Any]):
         raise HTTPException(status_code=400, detail=f"Create event failed: {r.text}")
 
     return r.json()
-
-
-# -----------------------------
-# SAFE: list connections
-# -----------------------------
-@app.get("/connections/google")
-def list_google_connections():
-    require_env()
-    with engine.begin() as conn:
-        rows = conn.execute(text("""
-            SELECT customer_id, user_email, created_at
-            FROM oauth_tokens
-            WHERE provider='google'
-            ORDER BY created_at DESC
-            LIMIT 200
-        """)).fetchall()
-
-    return [{"customerId": r[0], "email": r[1], "connectedAt": str(r[2])} for r in rows]
-@app.post("/google/calendars/select")
-async def google_calendars_select(payload: Dict[str, Any]):
-    customer_id = payload.get("customerId")
-    selected_ids = payload.get("calendarIds")
-
-    if not customer_id or not isinstance(selected_ids, list) or not selected_ids:
-        raise HTTPException(status_code=400, detail="Send customerId and calendarIds (list).")
-
-    selected_ids = [s.strip() for s in selected_ids if isinstance(s, str) and s.strip()]
-    if not selected_ids:
-        raise HTTPException(status_code=400, detail="calendarIds must be non-empty strings.")
-
-    with engine.begin() as conn:
-        # mark all false
-        conn.execute(text("""
-            UPDATE customer_calendars
-            SET selected = FALSE
-            WHERE provider='google' AND customer_id=:customer_id
-        """), {"customer_id": customer_id})
-
-        # mark only chosen true
-        conn.execute(text("""
-            UPDATE customer_calendars
-            SET selected = TRUE
-            WHERE provider='google' AND customer_id=:customer_id
-              AND calendar_id = ANY(:ids)
-        """), {"customer_id": customer_id, "ids": selected_ids})
-
-    return {"customerId": customer_id, "selectedCalendarIds": selected_ids}
-@app.post("/customer/settings")
-async def set_customer_settings(payload: Dict[str, Any]):
-    require_env()
-
-    customer_id = payload.get("customerId")
-    timezone_name = payload.get("timeZone", "America/Denver")
-    work_start = int(payload.get("workStartHour", 9))
-    work_end = int(payload.get("workEndHour", 17))
-    work_days = payload.get("workDays", [1,2,3,4,5])
-
-    if not customer_id:
-        raise HTTPException(status_code=400, detail="Missing customerId.")
-
-    days_str = ",".join(str(d) for d in work_days)
-
-    with engine.begin() as conn:
-        conn.execute(text("""
-        INSERT INTO customer_settings(customer_id, timezone, work_start_hour, work_end_hour, work_days)
-        VALUES (:cid, :tz, :ws, :we, :wd)
-        ON CONFLICT (customer_id)
-        DO UPDATE SET
-          timezone=:tz,
-          work_start_hour=:ws,
-          work_end_hour=:we,
-          work_days=:wd
-        """), {
-            "cid": customer_id,
-            "tz": timezone_name,
-            "ws": work_start,
-            "we": work_end,
-            "wd": days_str
-        })
-
-    return {"customerId": customer_id, "saved": True}
