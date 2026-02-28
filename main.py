@@ -221,6 +221,8 @@ def debug_schema():
                 ORDER BY table_name
             """)).fetchall()
 
+            table_names = [t[0] for t in tables]
+
             def cols(table: str):
                 rows = conn.execute(text("""
                     SELECT column_name, data_type
@@ -230,12 +232,13 @@ def debug_schema():
                 """), {"t": table}).fetchall()
                 return [{"name": r[0], "type": r[1]} for r in rows]
 
-        table_names = [t[0] for t in tables]
-        out = {"tables": table_names}
-        for t in ["oauth_tokens", "oauth_states", "customer_calendars", "customer_settings"]:
-            if t in table_names:
-                out[t] = cols(t)
-        return out
+            out = {"tables": table_names}
+            for t in ["oauth_tokens", "oauth_states", "customer_calendars", "customer_settings"]:
+                if t in table_names:
+                    out[t] = cols(t)
+
+            return out
+
     except Exception as e:
         return JSONResponse({"error": repr(e)}, status_code=500)
 
