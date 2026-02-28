@@ -893,3 +893,14 @@ async def google_create_event(payload: Dict[str, Any]):
         raise HTTPException(status_code=400, detail=f"Create event failed: {r.text}")
 
     return r.json()
+from sqlalchemy.exc import SQLAlchemyError
+
+@app.get("/debug/db")
+def debug_db():
+    try:
+        with engine.begin() as conn:
+            val = conn.execute(text("SELECT 1")).scalar()
+        return {"db_ok": True, "select_1": val}
+    except Exception as e:
+        # TEMP: shows the real error
+        return JSONResponse({"db_ok": False, "error": repr(e)}, status_code=500)
