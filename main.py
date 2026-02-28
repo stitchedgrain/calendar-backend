@@ -601,6 +601,9 @@ async def google_freebusy_debug(payload: Dict[str, Any]):
     rt = load_refresh_token_by_customer(customer_id)
     if not rt:
         raise HTTPException(status_code=401, detail="Customer not connected.")
+        
+validate_rfc3339(time_min)
+validate_rfc3339(time_max)
 
     access_token = refresh_access_token(rt)
 
