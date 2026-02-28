@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 import requests
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
 from sqlalchemy import create_engine, text
 
 app = FastAPI()
@@ -137,7 +137,7 @@ def weekday_name_to_int(name: str) -> Optional[int]:
 
 
 # -----------------------------
-# DB INIT
+# DB INIT (schema-safe)
 # -----------------------------
 def init_db():
     global engine
@@ -185,14 +185,59 @@ def init_db():
               timezone TEXT NOT NULL DEFAULT 'America/Denver',
               work_start_hour INTEGER NOT NULL DEFAULT 9,
               work_end_hour INTEGER NOT NULL DEFAULT 17,
-              work_days TEXT NOT NULL DEFAULT '0,1,2,3,4', -- Mon-Fri in Python weekday ints
+              work_days TEXT NOT NULL DEFAULT '0,1,2,3,4', -- Mon-Fri in python weekday ints
               created_at TIMESTAMPTZ DEFAULT NOW()
             );
         """))
 
 
-# Run init on import (Render boot)
 init_db()
+
+
+# -----------------------------
+# DEBUG ROUTES
+# -----------------------------
+@app.get("/debug/db")
+def debug_db():
+    try:
+        with engine.begin() as conn:
+            val = conn.execute(text("SELECT 1")).scalar()
+        return {"db_ok": True, "select_1": val}
+    except Exception as e:
+        return JSONResponse({"db_ok": False, "error": repr(e)}, status_code=500)
+
+
+@app.get("/debug/schema")
+def debug_schema():
+    """
+    Shows what tables exist + columns for key tables.
+    """
+    try:
+        with engine.begin() as conn:
+            tables = conn.execute(text("""
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema='public'
+                ORDER BY table_name
+            """)).fetchall()
+
+            def cols(table: str):
+                rows = conn.execute(text("""
+                    SELECT column_name, data_type
+                    FROM information_schema.columns
+                    WHERE table_schema='public' AND table_name=:t
+                    ORDER BY ordinal_position
+                """), {"t": table}).fetchall()
+                return [{"name": r[0], "type": r[1]} for r in rows]
+
+        table_names = [t[0] for t in tables]
+        out = {"tables": table_names}
+        for t in ["oauth_tokens", "oauth_states", "customer_calendars", "customer_settings"]:
+            if t in table_names:
+                out[t] = cols(t)
+        return out
+    except Exception as e:
+        return JSONResponse({"error": repr(e)}, status_code=500)
 
 
 # -----------------------------
@@ -300,7 +345,6 @@ def get_customer_settings(customer_id: str) -> Dict[str, Any]:
         """), {"cid": customer_id}).fetchone()
 
     if not row:
-        # defaults
         return {
             "timezone": "America/Denver",
             "work_start_hour": 9,
@@ -309,7 +353,6 @@ def get_customer_settings(customer_id: str) -> Dict[str, Any]:
         }
 
     tz_name, ws, we, days_str = row
-    days = []
     try:
         days = [int(x.strip()) for x in (days_str or "").split(",") if x.strip() != ""]
     except Exception:
@@ -395,6 +438,7 @@ def fetch_calendar_list(access_token: str) -> List[Dict[str, Any]]:
 def root():
     return {"status": "alive"}
 
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -414,13 +458,13 @@ async def set_customer_settings(payload: Dict[str, Any]):
     tz_name = payload.get("timeZone", "America/Denver")
     ws = int(payload.get("workStartHour", 9))
     we = int(payload.get("workEndHour", 17))
-    days = payload.get("workDays", [0, 1, 2, 3, 4])
+    days = payload.get("workDays", [0, 1, 2, 3, 4])  # Mon-Fri (python weekday)
 
     if ws < 0 or ws > 23 or we < 1 or we > 24 or we <= ws:
         raise HTTPException(status_code=400, detail="Invalid working hours. Example: start 9 end 17.")
 
-    if not isinstance(days, list) or not all(isinstance(d, int) for d in days):
-        raise HTTPException(status_code=400, detail="workDays must be a list of ints (Mon=0..Sun=6).")
+    if not isinstance(days, list) or not all(isinstance(d, int) and 0 <= d <= 6 for d in days):
+        raise HTTPException(status_code=400, detail="workDays must be list of ints (Mon=0..Sun=6).")
 
     try:
         ZoneInfo(tz_name)
@@ -493,7 +537,7 @@ def google_oauth_callback(code: Optional[str] = None, state: Optional[str] = Non
     calendars = fetch_calendar_list(access_token)
     store_calendars(customer_id, calendars)
 
-    # Create default settings row if not exists (optional)
+    # Ensure settings row exists
     s = get_customer_settings(customer_id)
     set_customer_settings_db(customer_id, s["timezone"], s["work_start_hour"], s["work_end_hour"], s["work_days"])
 
@@ -510,25 +554,32 @@ def google_oauth_callback(code: Optional[str] = None, state: Optional[str] = Non
 # -----------------------------
 @app.get("/google/calendars")
 def google_calendars(customerId: str = Query(...)):
+    """
+    Returns [] if none (no crash).
+    """
     require_env()
-    with engine.begin() as conn:
-        rows = conn.execute(text("""
-            SELECT calendar_id, summary, access_role, primary_cal, selected
-            FROM customer_calendars
-            WHERE provider='google' AND customer_id=:cid
-            ORDER BY primary_cal DESC, summary NULLS LAST, calendar_id
-        """), {"cid": customerId}).fetchall()
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(text("""
+                SELECT calendar_id, summary, access_role, primary_cal, selected
+                FROM customer_calendars
+                WHERE provider='google' AND customer_id=:cid
+                ORDER BY primary_cal DESC, summary NULLS LAST, calendar_id
+            """), {"cid": customerId}).fetchall()
 
-    return [
-        {
-            "calendarId": r[0],
-            "summary": r[1],
-            "accessRole": r[2],
-            "primary": bool(r[3]),
-            "selected": bool(r[4]),
-        }
-        for r in rows
-    ]
+        return [
+            {
+                "calendarId": r[0],
+                "summary": r[1],
+                "accessRole": r[2],
+                "primary": bool(r[3]),
+                "selected": bool(r[4]),
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        # keeps it readable instead of raw 500
+        raise HTTPException(status_code=500, detail=f"/google/calendars failed: {repr(e)}")
 
 
 @app.post("/google/calendars/sync")
@@ -580,32 +631,10 @@ async def google_calendars_select(payload: Dict[str, Any]):
 
 
 # -----------------------------
-# AVAILABILITY (DST SAFE, ANY TIMEZONE)
+# AVAILABILITY (DST SAFE)
 # -----------------------------
 @app.post("/google/availability")
 async def google_availability(payload: Dict[str, Any]):
-    """
-    Returns:
-      - merged busy blocks across selected calendars
-      - candidate slots (30min step default) for next 7 days (default)
-      - optional preference filtering + suggestions (3 default)
-
-    Request example:
-    {
-      "customerId": "pm_1",
-      "durationMinutes": 60,
-      "days": 7,
-      "stepMinutes": 30,
-      "preference": {
-        "type": "closest" | "weekday" | "datetime",
-        "weekday": "tuesday",
-        "preferredStart": "2026-03-03T14:00:00-07:00",
-        "timeOfDay": "morning" | "afternoon",
-        "strategy": "spread" | "closest",
-        "maxResults": 3
-      }
-    }
-    """
     require_env()
     customer_id = payload.get("customerId")
     if not customer_id:
@@ -629,7 +658,7 @@ async def google_availability(payload: Dict[str, Any]):
 
     settings = get_customer_settings(customer_id)
 
-    # Allow optional overrides in request (useful during testing)
+    # Optional overrides for testing
     tz_name = payload.get("timeZone", settings["timezone"])
     work_start = int(payload.get("workStartHour", settings["work_start_hour"]))
     work_end = int(payload.get("workEndHour", settings["work_end_hour"]))
@@ -648,6 +677,7 @@ async def google_availability(payload: Dict[str, Any]):
 
     access_token = refresh_access_token(rt)
 
+    # calendar ids
     calendar_ids = payload.get("calendarIds")
     if calendar_ids is None:
         calendar_ids = []
@@ -660,7 +690,7 @@ async def google_availability(payload: Dict[str, Any]):
     if not calendar_ids:
         calendar_ids = load_selected_calendar_ids(customer_id) or ["primary"]
 
-    # Overall window: now -> now+days in LOCAL time (DST-safe)
+    # window: now -> now+days in local time
     now_local = datetime.now(tz).replace(second=0, microsecond=0)
     start_local = now_local
     end_local = (start_local + timedelta(days=days)).replace(second=0, microsecond=0)
@@ -687,7 +717,6 @@ async def google_availability(payload: Dict[str, Any]):
     fb = r.json()
     calendars_obj = fb.get("calendars", {})
 
-    # Collect busy intervals across calendars -> UTC
     busy_intervals = []
     for _, info in calendars_obj.items():
         for b in info.get("busy", []):
@@ -702,9 +731,7 @@ async def google_availability(payload: Dict[str, Any]):
 
     busy_merged = merge_intervals(busy_intervals)
 
-    # Build working windows day-by-day in LOCAL, convert to UTC, subtract busy, generate slots
     dur = timedelta(minutes=duration_minutes)
-    step = timedelta(minutes=step_minutes)
 
     available = []
     cur_day = start_local.date()
@@ -731,32 +758,31 @@ async def google_availability(payload: Dict[str, Any]):
                     s = round_up_to_step(fi["start"], step_minutes)
                     while s + dur <= fi["end"]:
                         e = s + dur
+                        loc = s.astimezone(tz)
                         available.append({
                             "startUtc": iso_z(s),
                             "endUtc": iso_z(e),
                             "startLocal": format_local(s, tz),
                             "endLocal": format_local(e, tz),
-                            "weekdayLocal": s.astimezone(tz).weekday(),
-                            "hourLocal": s.astimezone(tz).hour,
+                            "weekdayLocal": loc.weekday(),
+                            "hourLocal": loc.hour,
                         })
-                        s = s + step
+                        s = s + timedelta(minutes=step_minutes)
 
         cur_day = (day0_local + timedelta(days=1)).date()
 
-    # -----------------------------
-    # Preference Filtering + Suggestions
-    # -----------------------------
+    # Preference logic
     pref = payload.get("preference") or {}
-    max_results = int(pref.get("maxResults", 3))
-    if max_results <= 0:
+    max_results = int(pref.get("maxResults", 3)) or 3
+    if max_results < 1:
         max_results = 3
 
     time_of_day = (pref.get("timeOfDay") or "").strip().lower()  # morning/afternoon/empty
+
     def tod_ok(slot: Dict[str, Any]) -> bool:
         if not time_of_day:
             return True
         h = int(slot["hourLocal"])
-        # morning: <12, afternoon: >=12 (within work hours already)
         if time_of_day == "morning":
             return h < 12
         if time_of_day == "afternoon":
@@ -766,14 +792,13 @@ async def google_availability(payload: Dict[str, Any]):
     filtered = [s for s in available if tod_ok(s)]
 
     pref_type = (pref.get("type") or "").strip().lower()
+    suggestions: List[Dict[str, Any]] = []
 
-    # Weekday filter like "tuesday"
     if pref_type == "weekday":
         wd = weekday_name_to_int(pref.get("weekday") or "")
         if wd is not None:
             filtered = [s for s in filtered if int(s["weekdayLocal"]) == wd]
 
-        # Spread strategy: morning, midday, late afternoon
         strategy = (pref.get("strategy") or "spread").strip().lower()
         if strategy == "spread":
             buckets = {"morning": [], "midday": [], "late": []}
@@ -786,14 +811,12 @@ async def google_availability(payload: Dict[str, Any]):
                 else:
                     buckets["late"].append(s)
 
-            suggestions = []
             for key in ["morning", "midday", "late"]:
                 if buckets[key]:
                     suggestions.append(buckets[key][0])
                 if len(suggestions) >= max_results:
                     break
 
-            # If not enough, fill from remaining chronological
             if len(suggestions) < max_results:
                 seen = set((x["startUtc"], x["endUtc"]) for x in suggestions)
                 for s in filtered:
@@ -804,27 +827,25 @@ async def google_availability(payload: Dict[str, Any]):
                     if len(suggestions) >= max_results:
                         break
         else:
-            # closest = first N on that weekday
             suggestions = filtered[:max_results]
 
     elif pref_type == "datetime":
-        # Choose closest to a preferredStart datetime (timezone-aware input required)
         pref_start = pref.get("preferredStart")
         if not pref_start:
             suggestions = filtered[:max_results]
         else:
             preferred_utc = parse_iso_to_utc(pref_start)
+
             def dist(slot: Dict[str, Any]) -> int:
                 s_utc = parse_iso_to_utc(slot["startUtc"])
                 return abs(int((s_utc - preferred_utc).total_seconds()))
-            filtered_sorted = sorted(filtered, key=dist)
-            suggestions = filtered_sorted[:max_results]
+
+            suggestions = sorted(filtered, key=dist)[:max_results]
 
     else:
-        # default / closest
+        # closest / default
         suggestions = filtered[:max_results]
 
-    # Remove helper fields from output
     def strip(slot: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "startUtc": slot["startUtc"],
@@ -837,13 +858,10 @@ async def google_availability(payload: Dict[str, Any]):
         "customerId": customer_id,
         "timeZone": tz_name,
         "workHours": {"startHour": work_start, "endHour": work_end, "days": work_days},
-        "days": days,
-        "durationMinutes": duration_minutes,
-        "stepMinutes": step_minutes,
         "calendarIdsUsed": calendar_ids,
         "availableCount": len(available),
         "suggestions": [strip(s) for s in suggestions],
-        "available": [strip(s) for s in available[:500]],  # cap
+        "available": [strip(s) for s in available[:500]],
     }
 
 
@@ -893,14 +911,3 @@ async def google_create_event(payload: Dict[str, Any]):
         raise HTTPException(status_code=400, detail=f"Create event failed: {r.text}")
 
     return r.json()
-from sqlalchemy.exc import SQLAlchemyError
-
-@app.get("/debug/db")
-def debug_db():
-    try:
-        with engine.begin() as conn:
-            val = conn.execute(text("SELECT 1")).scalar()
-        return {"db_ok": True, "select_1": val}
-    except Exception as e:
-        # TEMP: shows the real error
-        return JSONResponse({"db_ok": False, "error": repr(e)}, status_code=500)
