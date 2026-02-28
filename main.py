@@ -178,6 +178,10 @@ def init_db():
               PRIMARY KEY (provider, customer_id, calendar_id)
             );
         """))
+        conn.execute(text("""
+    ALTER TABLE customer_calendars
+    ADD COLUMN IF NOT EXISTS access_role TEXT;
+"""))
 
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS customer_settings (
