@@ -914,3 +914,11 @@ async def google_create_event(payload: Dict[str, Any]):
         raise HTTPException(status_code=400, detail=f"Create event failed: {r.text}")
 
     return r.json()
+@app.post("/debug/migrate_add_access_role")
+def migrate_add_access_role():
+    with engine.begin() as conn:
+        conn.execute(text("""
+            ALTER TABLE customer_calendars
+            ADD COLUMN IF NOT EXISTS access_role TEXT;
+        """))
+    return {"ok": True, "added": "access_role"}
