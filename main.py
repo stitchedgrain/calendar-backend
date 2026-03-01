@@ -34,7 +34,8 @@ GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 
 GOOGLE_FREEBUSY_URL = "https://www.googleapis.com/calendar/v3/freeBusy"
 GOOGLE_CALENDAR_LIST_URL = "https://www.googleapis.com/calendar/v3/users/me/calendarList"
-GOOGLE_EVENTS_INSERT_URL = "https://www.googleapis.com/calendar/v3/calendars/{calendarId}/events"
+GOOGLE_EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/{calendarId}/events"
+GOOGLE_EVENT_URL = "https://www.googleapis.com/calendar/v3/calendars/{calendarId}/events/{eventId}"
 
 engine = None
 
@@ -67,9 +68,24 @@ def make_engine():
 
 
 def parse_iso_to_utc(s: str) -> datetime:
+    """RFC3339 with offset or Z required."""
     dt = datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
     if dt.tzinfo is None:
         raise HTTPException(status_code=400, detail=f"Datetime missing timezone/offset: {s}")
+    return dt.astimezone(timezone.utc)
+
+
+def parse_iso_assume_tz(s: str, tz: ZoneInfo) -> datetime:
+    """
+    Accepts:
+      - "2026-03-03T14:00:00-07:00" (has offset) -> UTC
+      - "2026-03-03T21:00:00Z" (Z) -> UTC
+      - "2026-03-03T14:00:00" (naive) -> assume tz, then UTC
+    """
+    raw = s.strip()
+    dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=tz)
     return dt.astimezone(timezone.utc)
 
 
@@ -178,10 +194,12 @@ def init_db():
               PRIMARY KEY (provider, customer_id, calendar_id)
             );
         """))
+
+        # Backfill for older tables created without access_role
         conn.execute(text("""
-    ALTER TABLE customer_calendars
-    ADD COLUMN IF NOT EXISTS access_role TEXT;
-"""))
+            ALTER TABLE customer_calendars
+            ADD COLUMN IF NOT EXISTS access_role TEXT;
+        """))
 
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS customer_settings (
@@ -213,9 +231,6 @@ def debug_db():
 
 @app.get("/debug/schema")
 def debug_schema():
-    """
-    Shows what tables exist + columns for key tables.
-    """
     try:
         with engine.begin() as conn:
             tables = conn.execute(text("""
@@ -242,7 +257,6 @@ def debug_schema():
                     out[t] = cols(t)
 
             return out
-
     except Exception as e:
         return JSONResponse({"error": repr(e)}, status_code=500)
 
@@ -561,32 +575,25 @@ def google_oauth_callback(code: Optional[str] = None, state: Optional[str] = Non
 # -----------------------------
 @app.get("/google/calendars")
 def google_calendars(customerId: str = Query(...)):
-    """
-    Returns [] if none (no crash).
-    """
     require_env()
-    try:
-        with engine.begin() as conn:
-            rows = conn.execute(text("""
-                SELECT calendar_id, summary, access_role, primary_cal, selected
-                FROM customer_calendars
-                WHERE provider='google' AND customer_id=:cid
-                ORDER BY primary_cal DESC, summary NULLS LAST, calendar_id
-            """), {"cid": customerId}).fetchall()
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT calendar_id, summary, access_role, primary_cal, selected
+            FROM customer_calendars
+            WHERE provider='google' AND customer_id=:cid
+            ORDER BY primary_cal DESC, summary NULLS LAST, calendar_id
+        """), {"cid": customerId}).fetchall()
 
-        return [
-            {
-                "calendarId": r[0],
-                "summary": r[1],
-                "accessRole": r[2],
-                "primary": bool(r[3]),
-                "selected": bool(r[4]),
-            }
-            for r in rows
-        ]
-    except Exception as e:
-        # keeps it readable instead of raw 500
-        raise HTTPException(status_code=500, detail=f"/google/calendars failed: {repr(e)}")
+    return [
+        {
+            "calendarId": r[0],
+            "summary": r[1],
+            "accessRole": r[2],
+            "primary": bool(r[3]),
+            "selected": bool(r[4]),
+        }
+        for r in rows
+    ]
 
 
 @app.post("/google/calendars/sync")
@@ -651,10 +658,6 @@ async def google_availability(payload: Dict[str, Any]):
     if duration_minutes <= 0:
         raise HTTPException(status_code=400, detail="durationMinutes must be > 0.")
 
-    days = int(payload.get("days", 7))
-    if days <= 0 or days > 31:
-        raise HTTPException(status_code=400, detail="days must be 1..31.")
-
     step_minutes = int(payload.get("stepMinutes", 30))
     if step_minutes <= 0:
         raise HTTPException(status_code=400, detail="stepMinutes must be > 0.")
@@ -665,7 +668,7 @@ async def google_availability(payload: Dict[str, Any]):
 
     settings = get_customer_settings(customer_id)
 
-    # Optional overrides for testing
+    # Optional overrides
     tz_name = payload.get("timeZone", settings["timezone"])
     work_start = int(payload.get("workStartHour", settings["work_start_hour"]))
     work_end = int(payload.get("workEndHour", settings["work_end_hour"]))
@@ -697,13 +700,28 @@ async def google_availability(payload: Dict[str, Any]):
     if not calendar_ids:
         calendar_ids = load_selected_calendar_ids(customer_id) or ["primary"]
 
-    # window: now -> now+days in local time
-    now_local = datetime.now(tz).replace(second=0, microsecond=0)
-    start_local = now_local
-    end_local = (start_local + timedelta(days=days)).replace(second=0, microsecond=0)
+    # -----------------------------
+    # RANGE: if timeMin/timeMax provided, use them; else use now->now+days
+    # -----------------------------
+    time_min_str = payload.get("timeMin")
+    time_max_str = payload.get("timeMax")
 
-    time_min_utc = start_local.astimezone(timezone.utc)
-    time_max_utc = end_local.astimezone(timezone.utc)
+    if time_min_str and time_max_str:
+        time_min_utc = parse_iso_assume_tz(time_min_str, tz)
+        time_max_utc = parse_iso_assume_tz(time_max_str, tz)
+        if time_max_utc <= time_min_utc:
+            raise HTTPException(status_code=400, detail="timeMax must be after timeMin.")
+        start_local = time_min_utc.astimezone(tz)
+        end_local = time_max_utc.astimezone(tz)
+    else:
+        days = int(payload.get("days", 7))
+        if days <= 0 or days > 31:
+            raise HTTPException(status_code=400, detail="days must be 1..31.")
+        now_local = datetime.now(tz).replace(second=0, microsecond=0)
+        start_local = now_local
+        end_local = (start_local + timedelta(days=days)).replace(second=0, microsecond=0)
+        time_min_utc = start_local.astimezone(timezone.utc)
+        time_max_utc = end_local.astimezone(timezone.utc)
 
     google_body = {
         "timeMin": iso_z(time_min_utc),
@@ -739,8 +757,8 @@ async def google_availability(payload: Dict[str, Any]):
     busy_merged = merge_intervals(busy_intervals)
 
     dur = timedelta(minutes=duration_minutes)
-
     available = []
+
     cur_day = start_local.date()
     last_day = end_local.date()
 
@@ -841,7 +859,7 @@ async def google_availability(payload: Dict[str, Any]):
         if not pref_start:
             suggestions = filtered[:max_results]
         else:
-            preferred_utc = parse_iso_to_utc(pref_start)
+            preferred_utc = parse_iso_assume_tz(pref_start, tz)
 
             def dist(slot: Dict[str, Any]) -> int:
                 s_utc = parse_iso_to_utc(slot["startUtc"])
@@ -864,6 +882,7 @@ async def google_availability(payload: Dict[str, Any]):
     return {
         "customerId": customer_id,
         "timeZone": tz_name,
+        "window": {"timeMinUtc": iso_z(time_min_utc), "timeMaxUtc": iso_z(time_max_utc)},
         "workHours": {"startHour": work_start, "endHour": work_end, "days": work_days},
         "calendarIdsUsed": calendar_ids,
         "availableCount": len(available),
@@ -873,7 +892,7 @@ async def google_availability(payload: Dict[str, Any]):
 
 
 # -----------------------------
-# CREATE EVENT
+# CREATE / CANCEL / RESCHEDULE EVENT
 # -----------------------------
 @app.post("/google/create_event")
 async def google_create_event(payload: Dict[str, Any]):
@@ -890,7 +909,7 @@ async def google_create_event(payload: Dict[str, Any]):
     access_token = refresh_access_token(rt)
 
     calendar_id = payload.get("calendarId", "primary")
-    url = GOOGLE_EVENTS_INSERT_URL.format(calendarId=calendar_id)
+    url = GOOGLE_EVENTS_URL.format(calendarId=calendar_id)
 
     start_obj = payload.get("start")
     end_obj = payload.get("end")
@@ -918,11 +937,78 @@ async def google_create_event(payload: Dict[str, Any]):
         raise HTTPException(status_code=400, detail=f"Create event failed: {r.text}")
 
     return r.json()
-@app.post("/debug/migrate_add_access_role")
-def migrate_add_access_role():
-    with engine.begin() as conn:
-        conn.execute(text("""
-            ALTER TABLE customer_calendars
-            ADD COLUMN IF NOT EXISTS access_role TEXT;
-        """))
-    return {"ok": True, "added": "access_role"}
+
+
+@app.post("/google/cancel_event")
+async def google_cancel_event(payload: Dict[str, Any]):
+    """
+    Body:
+    {
+      "customerId":"pm_1",
+      "calendarId":"primary",
+      "eventId":"<google_event_id>"
+    }
+    """
+    require_env()
+    customer_id = payload.get("customerId")
+    calendar_id = payload.get("calendarId", "primary")
+    event_id = payload.get("eventId")
+
+    if not customer_id or not event_id:
+        raise HTTPException(status_code=400, detail="Missing customerId or eventId.")
+
+    rt = load_refresh_token(customer_id)
+    if not rt:
+        raise HTTPException(status_code=401, detail="Customer not connected.")
+
+    access_token = refresh_access_token(rt)
+
+    url = GOOGLE_EVENT_URL.format(calendarId=calendar_id, eventId=event_id)
+    r = requests.delete(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=400, detail=f"Cancel failed: {r.text}")
+
+    return {"cancelled": True, "calendarId": calendar_id, "eventId": event_id}
+
+
+@app.post("/google/reschedule_event")
+async def google_reschedule_event(payload: Dict[str, Any]):
+    """
+    Body:
+    {
+      "customerId":"pm_1",
+      "calendarId":"primary",
+      "eventId":"<google_event_id>",
+      "start": {"dateTime":"...", "timeZone":"America/Denver"},
+      "end": {"dateTime":"...", "timeZone":"America/Denver"}
+    }
+    """
+    require_env()
+    customer_id = payload.get("customerId")
+    calendar_id = payload.get("calendarId", "primary")
+    event_id = payload.get("eventId")
+    start_obj = payload.get("start")
+    end_obj = payload.get("end")
+
+    if not customer_id or not event_id or not start_obj or not end_obj:
+        raise HTTPException(status_code=400, detail="Missing customerId/eventId/start/end.")
+
+    rt = load_refresh_token(customer_id)
+    if not rt:
+        raise HTTPException(status_code=401, detail="Customer not connected.")
+
+    access_token = refresh_access_token(rt)
+
+    url = GOOGLE_EVENT_URL.format(calendarId=calendar_id, eventId=event_id)
+    patch_body = {"start": start_obj, "end": end_obj}
+
+    r = requests.patch(
+        url,
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+        data=json.dumps(patch_body),
+        timeout=30,
+    )
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=400, detail=f"Reschedule failed: {r.text}")
+
+    return r.json()
