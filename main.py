@@ -965,69 +965,45 @@ async def google_create_event(payload: Dict[str, Any]):
     if not start_obj or not end_obj or not start_obj.get("dateTime") or not end_obj.get("dateTime"):
         return JSONResponse({"booked": False, "reason": "missing_start_end"}, status_code=400)
 
-    # -----------------------------
-    # PREVENT DOUBLE BOOKING (structured JSON)
-    # Re-check SAME calendars used for availability
-    # -----------------------------
-    settings = get_customer_settings(customer_id)
-    tz_name = settings["timezone"]
-    tz = ZoneInfo(tz_name)
+# -----------------------------
+# PREVENT DOUBLE BOOKING (STRICT)
+# -----------------------------
+settings = get_customer_settings(customer_id)
+tz_name = settings["timezone"]
+tz = ZoneInfo(tz_name)
 
-    start_utc = parse_iso_assume_tz(start_obj["dateTime"], tz)
-    end_utc = parse_iso_assume_tz(end_obj["dateTime"], tz)
+start_utc = parse_iso_assume_tz(start_obj["dateTime"], tz)
+end_utc = parse_iso_assume_tz(end_obj["dateTime"], tz)
 
-    calendars_to_check = load_selected_calendar_ids(customer_id) or ["primary"]
+# Union of calendars: selected + the one we are writing to
+selected = load_selected_calendar_ids(customer_id) or []
+calendars_to_check = sorted(set(selected + [calendar_id] + (["primary"] if calendar_id != "primary" else [])))
 
-    check = verify_slot_is_free(access_token, calendars_to_check, start_utc, end_utc, tz_name)
-
-    if not check.get("ok"):
-        return JSONResponse(
-            {"booked": False, "reason": "freebusy_check_failed", "message": "Could not verify availability.", "debug": check},
-            status_code=503,
-        )
-
-    if not check.get("slotFree"):
-        return JSONResponse(
-            {
-                "booked": False,
-                "reason": "slot_taken",
-                "message": "That time overlaps an existing busy block.",
-                "checkedCalendars": calendars_to_check,
-                "busy": check.get("busy", []),
-            },
-            status_code=409,
-        )
-
-    event_body = {
-        "summary": payload.get("summary", "Booking"),
-        "description": payload.get("description", ""),
-        "start": start_obj,
-        "end": end_obj,
-    }
-
-    attendees = payload.get("attendees")
-    if attendees:
-        event_body["attendees"] = attendees
-
-    r = requests.post(
-        url,
-        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-        data=json.dumps(event_body),
-        timeout=30,
+# 1) Multi-calendar freebusy check
+fb_check = verify_slot_is_free(access_token, calendars_to_check, start_utc, end_utc, tz_name)
+if not fb_check.get("ok"):
+    return JSONResponse(
+        {"booked": False, "reason": "freebusy_check_failed", "debug": fb_check},
+        status_code=503,
+    )
+if not fb_check.get("slotFree"):
+    return JSONResponse(
+        {"booked": False, "reason": "slot_taken", "source": "freebusy", "busy": fb_check.get("busy", [])},
+        status_code=409,
     )
 
-    if r.status_code not in (200, 201):
-        return JSONResponse(
-            {
-                "booked": False,
-                "reason": "create_event_failed",
-                "statusCode": r.status_code,
-                "googleResponseText": r.text,
-            },
-            status_code=400,
-        )
-
-    return {"booked": True, "event": r.json()}
+# 2) Strict check on the calendar we will INSERT INTO
+ev_check = list_events_overlap(access_token, calendar_id, start_utc, end_utc)
+if not ev_check.get("ok"):
+    return JSONResponse(
+        {"booked": False, "reason": "events_list_failed", "debug": ev_check},
+        status_code=503,
+    )
+if ev_check.get("overlap"):
+    return JSONResponse(
+        {"booked": False, "reason": "slot_taken", "source": "events_list", "overlappingEvents": ev_check.get("events", [])},
+        status_code=409,
+    )
 
 
 @app.post("/google/cancel_event")
