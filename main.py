@@ -218,6 +218,16 @@ init_db()
 # -----------------------------
 # DEBUG ROUTES
 # -----------------------------
+@app.get("/")
+def root():
+    return {"status": "alive"}
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
 @app.get("/debug/db")
 def debug_db():
     try:
@@ -443,7 +453,8 @@ def verify_slot_is_free(
     tz_name: str
 ) -> Dict[str, Any]:
     """
-    Never raises HTTPException. Always returns structured JSON.
+    Multi-calendar check using freeBusy.
+    Never raises. Always returns JSON.
     """
     body = {
         "timeMin": iso_z(start_utc),
@@ -485,13 +496,15 @@ def verify_slot_is_free(
         busy_out.append({"calendarId": cal_id, "busy": cal_busy})
 
     return {"ok": True, "slotFree": slot_free, "busy": busy_out, "checkedCalendars": calendar_ids}
+
+
 def list_events_overlap(access_token: str, calendar_id: str, start_utc: datetime, end_utc: datetime) -> Dict[str, Any]:
     """
-    Strict overlap check on ONE calendar, regardless of 'free/busy' transparency.
-    Returns structured JSON and never throws.
+    Strict single-calendar overlap check using events.list.
+    Catches events marked as 'Free' that freeBusy might not block.
+    Never raises. Always returns JSON.
     """
     url = GOOGLE_EVENTS_URL.format(calendarId=calendar_id)
-
     params = {
         "timeMin": iso_z(start_utc),
         "timeMax": iso_z(end_utc),
@@ -516,8 +529,6 @@ def list_events_overlap(access_token: str, calendar_id: str, start_utc: datetime
     data = r.json()
     items = data.get("items", []) or []
 
-    # Any event returned here overlaps the timeMin/timeMax window in some way.
-    # Filter out cancelled.
     overlaps = []
     for ev in items:
         if ev.get("status") == "cancelled":
@@ -527,26 +538,14 @@ def list_events_overlap(access_token: str, calendar_id: str, start_utc: datetime
             "summary": ev.get("summary"),
             "start": ev.get("start"),
             "end": ev.get("end"),
-            "transparency": ev.get("transparency"),  # can be "transparent"
+            "transparency": ev.get("transparency"),
         })
 
     return {"ok": True, "overlap": len(overlaps) > 0, "events": overlaps}
 
-# -----------------------------
-# BASIC ROUTES
-# -----------------------------
-@app.get("/")
-def root():
-    return {"status": "alive"}
-
-
-@app.get("/health")
-def health():
-    return {"ok": True}
-
 
 # -----------------------------
-# CUSTOMER SETTINGS
+# CUSTOMER SETTINGS ROUTE
 # -----------------------------
 @app.post("/customer/settings")
 async def set_customer_settings(payload: Dict[str, Any]):
@@ -563,7 +562,6 @@ async def set_customer_settings(payload: Dict[str, Any]):
 
     if ws < 0 or ws > 23 or we < 1 or we > 24 or we <= ws:
         raise HTTPException(status_code=400, detail="Invalid working hours. Example: start 9 end 17.")
-
     if not isinstance(days, list) or not all(isinstance(d, int) and 0 <= d <= 6 for d in days):
         raise HTTPException(status_code=400, detail="workDays must be list of ints (Mon=0..Sun=6).")
 
@@ -622,23 +620,17 @@ def google_oauth_callback(code: Optional[str] = None, state: Optional[str] = Non
 
     user_email = get_user_email(access_token)
 
-    # If Google didn't return refresh_token, keep existing if present
     if not refresh_token:
         existing = load_refresh_token(customer_id)
         if not existing:
-            raise HTTPException(
-                status_code=400,
-                detail="No refresh token returned. Remove app access in Google Account then reconnect.",
-            )
+            raise HTTPException(status_code=400, detail="No refresh token returned. Remove app access then reconnect.")
         refresh_token = existing
 
     upsert_refresh_token(customer_id, refresh_token, scope, token_type, user_email)
 
-    # Sync calendars immediately
     calendars = fetch_calendar_list(access_token)
     store_calendars(customer_id, calendars)
 
-    # Ensure settings row exists
     s = get_customer_settings(customer_id)
     set_customer_settings_db(customer_id, s["timezone"], s["work_start_hour"], s["work_end_hour"], s["work_days"])
 
@@ -646,7 +638,7 @@ def google_oauth_callback(code: Optional[str] = None, state: Optional[str] = Non
         "connected": True,
         "customerId": customer_id,
         "email": user_email,
-        "message": "Google connected and calendars synced. Use /google/calendars then /google/calendars/select, then /google/availability.",
+        "message": "Google connected and calendars synced. Next: /google/calendars -> /google/calendars/select -> /google/availability",
     }
 
 
@@ -685,7 +677,7 @@ async def google_calendars_sync(payload: Dict[str, Any]):
 
     rt = load_refresh_token(customer_id)
     if not rt:
-        raise HTTPException(status_code=401, detail="Customer not connected. Run /oauth/google/start?customerId=...")
+        raise HTTPException(status_code=401, detail="Customer not connected.")
 
     access_token = refresh_access_token(rt)
     calendars = fetch_calendar_list(access_token)
@@ -735,16 +727,19 @@ async def google_availability(payload: Dict[str, Any]):
         raise HTTPException(status_code=400, detail="Missing customerId.")
 
     duration_minutes = int(payload.get("durationMinutes", 60))
+    step_minutes = int(payload.get("stepMinutes", 30))
+    days = int(payload.get("days", 7))
+
     if duration_minutes <= 0:
         raise HTTPException(status_code=400, detail="durationMinutes must be > 0.")
-
-    step_minutes = int(payload.get("stepMinutes", 30))
     if step_minutes <= 0:
         raise HTTPException(status_code=400, detail="stepMinutes must be > 0.")
+    if days <= 0 or days > 31:
+        raise HTTPException(status_code=400, detail="days must be 1..31.")
 
     rt = load_refresh_token(customer_id)
     if not rt:
-        raise HTTPException(status_code=401, detail="Customer not connected. Run /oauth/google/start?customerId=...")
+        raise HTTPException(status_code=401, detail="Customer not connected.")
 
     settings = get_customer_settings(customer_id)
 
@@ -753,50 +748,23 @@ async def google_availability(payload: Dict[str, Any]):
     work_end = int(payload.get("workEndHour", settings["work_end_hour"]))
     work_days = payload.get("workDays", settings["work_days"])
 
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        raise HTTPException(status_code=400, detail=f"Invalid timeZone: {tz_name}")
-
-    if work_end <= work_start:
-        raise HTTPException(status_code=400, detail="workEndHour must be > workStartHour.")
-
-    if not isinstance(work_days, list) or not all(isinstance(d, int) and 0 <= d <= 6 for d in work_days):
-        raise HTTPException(status_code=400, detail="workDays must be list of ints 0..6 (Mon=0..Sun=6).")
+    tz = ZoneInfo(tz_name)
 
     access_token = refresh_access_token(rt)
 
-    calendar_ids = payload.get("calendarIds")
-    if calendar_ids is None:
-        calendar_ids = []
-    elif isinstance(calendar_ids, str):
+    calendar_ids = payload.get("calendarIds") or []
+    if isinstance(calendar_ids, str):
         calendar_ids = [calendar_ids]
-    elif not isinstance(calendar_ids, list):
-        raise HTTPException(status_code=400, detail="calendarIds must be a list of strings or a single string.")
-
     calendar_ids = [cid.strip() for cid in calendar_ids if isinstance(cid, str) and cid.strip()]
     if not calendar_ids:
         calendar_ids = load_selected_calendar_ids(customer_id) or ["primary"]
 
-    time_min_str = payload.get("timeMin")
-    time_max_str = payload.get("timeMax")
+    now_local = datetime.now(tz).replace(second=0, microsecond=0)
+    start_local = now_local
+    end_local = (start_local + timedelta(days=days)).replace(second=0, microsecond=0)
 
-    if time_min_str and time_max_str:
-        time_min_utc = parse_iso_assume_tz(time_min_str, tz)
-        time_max_utc = parse_iso_assume_tz(time_max_str, tz)
-        if time_max_utc <= time_min_utc:
-            raise HTTPException(status_code=400, detail="timeMax must be after timeMin.")
-        start_local = time_min_utc.astimezone(tz)
-        end_local = time_max_utc.astimezone(tz)
-    else:
-        days = int(payload.get("days", 7))
-        if days <= 0 or days > 31:
-            raise HTTPException(status_code=400, detail="days must be 1..31.")
-        now_local = datetime.now(tz).replace(second=0, microsecond=0)
-        start_local = now_local
-        end_local = (start_local + timedelta(days=days)).replace(second=0, microsecond=0)
-        time_min_utc = start_local.astimezone(timezone.utc)
-        time_max_utc = end_local.astimezone(timezone.utc)
+    time_min_utc = start_local.astimezone(timezone.utc)
+    time_max_utc = end_local.astimezone(timezone.utc)
 
     google_body = {
         "timeMin": iso_z(time_min_utc),
@@ -812,15 +780,8 @@ async def google_availability(payload: Dict[str, Any]):
         timeout=30,
     )
     if r.status_code != 200:
-        # structured JSON instead of raw error
         return JSONResponse(
-            {
-                "ok": False,
-                "reason": "freebusy_failed",
-                "statusCode": r.status_code,
-                "googleResponseText": r.text,
-                "requestBody": google_body,
-            },
+            {"ok": False, "reason": "freebusy_failed", "statusCode": r.status_code, "googleResponseText": r.text, "requestBody": google_body},
             status_code=400,
         )
 
@@ -855,88 +816,29 @@ async def google_availability(payload: Dict[str, Any]):
             win_start_local = day0_local.replace(hour=work_start, minute=0)
             win_end_local = day0_local.replace(hour=work_end, minute=0)
 
-            if win_end_local > start_local and win_start_local < end_local:
-                win_start_local = max(win_start_local, start_local)
-                win_end_local = min(win_end_local, end_local)
+            free_intervals = subtract_busy_from_window(
+                win_start_local.astimezone(timezone.utc),
+                win_end_local.astimezone(timezone.utc),
+                busy_merged,
+            )
 
-                win_start_utc = win_start_local.astimezone(timezone.utc)
-                win_end_utc = win_end_local.astimezone(timezone.utc)
-
-                free_intervals = subtract_busy_from_window(win_start_utc, win_end_utc, busy_merged)
-
-                for fi in free_intervals:
-                    s = round_up_to_step(fi["start"], step_minutes)
-                    while s + dur <= fi["end"]:
-                        e = s + dur
-                        loc = s.astimezone(tz)
-                        available.append({
-                            "startUtc": iso_z(s),
-                            "endUtc": iso_z(e),
-                            "startLocal": format_local(s, tz),
-                            "endLocal": format_local(e, tz),
-                            "weekdayLocal": loc.weekday(),
-                            "hourLocal": loc.hour,
-                        })
-                        s = s + timedelta(minutes=step_minutes)
+            for fi in free_intervals:
+                s = round_up_to_step(fi["start"], step_minutes)
+                while s + dur <= fi["end"]:
+                    e = s + dur
+                    available.append({"startUtc": iso_z(s), "endUtc": iso_z(e), "startLocal": format_local(s, tz), "endLocal": format_local(e, tz)})
+                    s = s + timedelta(minutes=step_minutes)
 
         cur_day = (day0_local + timedelta(days=1)).date()
-
-    pref = payload.get("preference") or {}
-    max_results = int(pref.get("maxResults", 3)) or 3
-    if max_results < 1:
-        max_results = 3
-
-    time_of_day = (pref.get("timeOfDay") or "").strip().lower()
-
-    def tod_ok(slot: Dict[str, Any]) -> bool:
-        if not time_of_day:
-            return True
-        h = int(slot["hourLocal"])
-        if time_of_day == "morning":
-            return h < 12
-        if time_of_day == "afternoon":
-            return h >= 12
-        return True
-
-    filtered = [s for s in available if tod_ok(s)]
-
-    pref_type = (pref.get("type") or "").strip().lower()
-    suggestions: List[Dict[str, Any]] = []
-
-    if pref_type == "weekday":
-        wd = weekday_name_to_int(pref.get("weekday") or "")
-        if wd is not None:
-            filtered = [s for s in filtered if int(s["weekdayLocal"]) == wd]
-        suggestions = filtered[:max_results]
-
-    elif pref_type == "datetime":
-        pref_start = pref.get("preferredStart")
-        if not pref_start:
-            suggestions = filtered[:max_results]
-        else:
-            preferred_utc = parse_iso_assume_tz(pref_start, tz)
-
-            def dist(slot: Dict[str, Any]) -> int:
-                s_utc = parse_iso_to_utc(slot["startUtc"])
-                return abs(int((s_utc - preferred_utc).total_seconds()))
-
-            suggestions = sorted(filtered, key=dist)[:max_results]
-    else:
-        suggestions = filtered[:max_results]
-
-    def strip(slot: Dict[str, Any]) -> Dict[str, Any]:
-        return {"startUtc": slot["startUtc"], "endUtc": slot["endUtc"], "startLocal": slot["startLocal"], "endLocal": slot["endLocal"]}
 
     return {
         "ok": True,
         "customerId": customer_id,
         "timeZone": tz_name,
-        "window": {"timeMinUtc": iso_z(time_min_utc), "timeMaxUtc": iso_z(time_max_utc)},
-        "workHours": {"startHour": work_start, "endHour": work_end, "days": work_days},
         "calendarIdsUsed": calendar_ids,
         "availableCount": len(available),
-        "suggestions": [strip(s) for s in suggestions],
-        "available": [strip(s) for s in available[:500]],
+        "suggestions": available[:3],
+        "available": available[:500],
     }
 
 
@@ -965,45 +867,53 @@ async def google_create_event(payload: Dict[str, Any]):
     if not start_obj or not end_obj or not start_obj.get("dateTime") or not end_obj.get("dateTime"):
         return JSONResponse({"booked": False, "reason": "missing_start_end"}, status_code=400)
 
-# -----------------------------
-# PREVENT DOUBLE BOOKING (STRICT)
-# -----------------------------
-settings = get_customer_settings(customer_id)
-tz_name = settings["timezone"]
-tz = ZoneInfo(tz_name)
+    settings = get_customer_settings(customer_id)
+    tz_name = settings["timezone"]
+    tz = ZoneInfo(tz_name)
 
-start_utc = parse_iso_assume_tz(start_obj["dateTime"], tz)
-end_utc = parse_iso_assume_tz(end_obj["dateTime"], tz)
+    start_utc = parse_iso_assume_tz(start_obj["dateTime"], tz)
+    end_utc = parse_iso_assume_tz(end_obj["dateTime"], tz)
 
-# Union of calendars: selected + the one we are writing to
-selected = load_selected_calendar_ids(customer_id) or []
-calendars_to_check = sorted(set(selected + [calendar_id] + (["primary"] if calendar_id != "primary" else [])))
+    selected = load_selected_calendar_ids(customer_id) or []
+    calendars_to_check = sorted(set(selected + [calendar_id] + (["primary"] if calendar_id != "primary" else [])))
 
-# 1) Multi-calendar freebusy check
-fb_check = verify_slot_is_free(access_token, calendars_to_check, start_utc, end_utc, tz_name)
-if not fb_check.get("ok"):
-    return JSONResponse(
-        {"booked": False, "reason": "freebusy_check_failed", "debug": fb_check},
-        status_code=503,
-    )
-if not fb_check.get("slotFree"):
-    return JSONResponse(
-        {"booked": False, "reason": "slot_taken", "source": "freebusy", "busy": fb_check.get("busy", [])},
-        status_code=409,
+    fb_check = verify_slot_is_free(access_token, calendars_to_check, start_utc, end_utc, tz_name)
+    if not fb_check.get("ok"):
+        return JSONResponse({"booked": False, "reason": "freebusy_check_failed", "debug": fb_check}, status_code=503)
+    if not fb_check.get("slotFree"):
+        return JSONResponse({"booked": False, "reason": "slot_taken", "source": "freebusy", "busy": fb_check.get("busy", [])}, status_code=409)
+
+    ev_check = list_events_overlap(access_token, calendar_id, start_utc, end_utc)
+    if not ev_check.get("ok"):
+        return JSONResponse({"booked": False, "reason": "events_list_failed", "debug": ev_check}, status_code=503)
+    if ev_check.get("overlap"):
+        return JSONResponse({"booked": False, "reason": "slot_taken", "source": "events_list", "overlappingEvents": ev_check.get("events", [])}, status_code=409)
+
+    event_body = {
+        "summary": payload.get("summary", "Booking"),
+        "description": payload.get("description", ""),
+        "start": start_obj,
+        "end": end_obj,
+    }
+
+    attendees = payload.get("attendees")
+    if attendees:
+        event_body["attendees"] = attendees
+
+    r = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+        data=json.dumps(event_body),
+        timeout=30,
     )
 
-# 2) Strict check on the calendar we will INSERT INTO
-ev_check = list_events_overlap(access_token, calendar_id, start_utc, end_utc)
-if not ev_check.get("ok"):
-    return JSONResponse(
-        {"booked": False, "reason": "events_list_failed", "debug": ev_check},
-        status_code=503,
-    )
-if ev_check.get("overlap"):
-    return JSONResponse(
-        {"booked": False, "reason": "slot_taken", "source": "events_list", "overlappingEvents": ev_check.get("events", [])},
-        status_code=409,
-    )
+    if r.status_code not in (200, 201):
+        return JSONResponse(
+            {"booked": False, "reason": "create_event_failed", "statusCode": r.status_code, "googleResponseText": r.text},
+            status_code=400,
+        )
+
+    return {"booked": True, "event": r.json()}
 
 
 @app.post("/google/cancel_event")
