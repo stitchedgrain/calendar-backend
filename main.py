@@ -2,7 +2,7 @@ import os
 import json
 import secrets
 from typing import Optional, Dict, Any, List
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
@@ -13,9 +13,9 @@ from sqlalchemy import create_engine, text
 
 app = FastAPI()
 
-# -----------------------------
+# =============================
 # ENV
-# -----------------------------
+# =============================
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
@@ -40,9 +40,9 @@ GOOGLE_EVENT_URL = "https://www.googleapis.com/calendar/v3/calendars/{calendarId
 engine = None
 
 
-# -----------------------------
-# CORE UTIL
-# -----------------------------
+# =============================
+# UTIL
+# =============================
 def require_env():
     missing = []
     for k, v in [
@@ -59,7 +59,6 @@ def require_env():
 
 def make_engine():
     url = DATABASE_URL
-    # Render often provides postgres:// ; SQLAlchemy prefers postgresql+psycopg://
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+psycopg://", 1)
     elif url.startswith("postgresql://"):
@@ -68,7 +67,6 @@ def make_engine():
 
 
 def parse_iso_to_utc(s: str) -> datetime:
-    """RFC3339 with offset or Z required."""
     dt = datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
     if dt.tzinfo is None:
         raise HTTPException(status_code=400, detail=f"Datetime missing timezone/offset: {s}")
@@ -76,12 +74,6 @@ def parse_iso_to_utc(s: str) -> datetime:
 
 
 def parse_iso_assume_tz(s: str, tz: ZoneInfo) -> datetime:
-    """
-    Accepts:
-      - "2026-03-03T14:00:00-07:00" (has offset) -> UTC
-      - "2026-03-03T21:00:00Z" (Z) -> UTC
-      - "2026-03-03T14:00:00" (naive) -> assume tz, then UTC
-    """
     raw = s.strip()
     dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
     if dt.tzinfo is None:
@@ -100,7 +92,7 @@ def merge_intervals(intervals: List[Dict[str, datetime]]) -> List[Dict[str, date
     merged = [intervals[0]]
     for cur in intervals[1:]:
         last = merged[-1]
-        if cur["start"] <= last["end"]:  # overlap or touch
+        if cur["start"] <= last["end"]:
             if cur["end"] > last["end"]:
                 last["end"] = cur["end"]
         else:
@@ -147,14 +139,17 @@ def weekday_name_to_int(name: str) -> Optional[int]:
         "saturday": 5, "sat": 5,
         "sunday": 6, "sun": 6,
     }
-    if not name:
-        return None
-    return m.get(name.strip().lower())
+    return m.get((name or "").strip().lower())
 
 
-# -----------------------------
-# DB INIT (schema-safe)
-# -----------------------------
+def safe_cal_id(cid: str) -> str:
+    # Must URL-encode calendar IDs like someone@group.calendar.google.com
+    return quote(cid, safe="")
+
+
+# =============================
+# DB INIT
+# =============================
 def init_db():
     global engine
     require_env()
@@ -172,7 +167,6 @@ def init_db():
               PRIMARY KEY (provider, customer_id)
             );
         """))
-
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS oauth_states (
               state TEXT PRIMARY KEY,
@@ -180,7 +174,6 @@ def init_db():
               created_at TIMESTAMPTZ DEFAULT NOW()
             );
         """))
-
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS customer_calendars (
               provider TEXT NOT NULL,
@@ -194,12 +187,6 @@ def init_db():
               PRIMARY KEY (provider, customer_id, calendar_id)
             );
         """))
-
-        conn.execute(text("""
-            ALTER TABLE customer_calendars
-            ADD COLUMN IF NOT EXISTS access_role TEXT;
-        """))
-
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS customer_settings (
               customer_id TEXT PRIMARY KEY,
@@ -215,9 +202,9 @@ def init_db():
 init_db()
 
 
-# -----------------------------
+# =============================
 # DEBUG ROUTES
-# -----------------------------
+# =============================
 @app.get("/")
 def root():
     return {"status": "alive"}
@@ -248,7 +235,6 @@ def debug_schema():
                 WHERE table_schema='public'
                 ORDER BY table_name
             """)).fetchall()
-
             table_names = [t[0] for t in tables]
 
             def cols(table: str):
@@ -264,15 +250,14 @@ def debug_schema():
             for t in ["oauth_tokens", "oauth_states", "customer_calendars", "customer_settings"]:
                 if t in table_names:
                     out[t] = cols(t)
-
             return out
     except Exception as e:
         return JSONResponse({"error": repr(e)}, status_code=500)
 
 
-# -----------------------------
+# =============================
 # DB HELPERS
-# -----------------------------
+# =============================
 def save_state(state: str, customer_id: str):
     with engine.begin() as conn:
         conn.execute(
@@ -310,13 +295,7 @@ def upsert_refresh_token(customer_id: str, refresh_token: str, scope: str, token
                   scope = EXCLUDED.scope,
                   token_type = EXCLUDED.token_type
             """),
-            {
-                "customer_id": customer_id,
-                "user_email": user_email,
-                "rt": refresh_token,
-                "scope": scope,
-                "tt": token_type,
-            },
+            {"customer_id": customer_id, "user_email": user_email, "rt": refresh_token, "scope": scope, "tt": token_type},
         )
 
 
@@ -379,16 +358,11 @@ def get_customer_settings(customer_id: str) -> Dict[str, Any]:
 
     tz_name, ws, we, days_str = row
     try:
-        days = [int(x.strip()) for x in (days_str or "").split(",") if x.strip() != ""]
+        days = [int(x.strip()) for x in (days_str or "").split(",") if x.strip()]
     except Exception:
         days = [0, 1, 2, 3, 4]
 
-    return {
-        "timezone": tz_name or "America/Denver",
-        "work_start_hour": int(ws),
-        "work_end_hour": int(we),
-        "work_days": days if days else [0, 1, 2, 3, 4],
-    }
+    return {"timezone": tz_name or "America/Denver", "work_start_hour": int(ws), "work_end_hour": int(we), "work_days": days or [0, 1, 2, 3, 4]}
 
 
 def set_customer_settings_db(customer_id: str, tz_name: str, ws: int, we: int, days: List[int]):
@@ -405,9 +379,9 @@ def set_customer_settings_db(customer_id: str, tz_name: str, ws: int, we: int, d
         """), {"cid": customer_id, "tz": tz_name, "ws": ws, "we": we, "wd": days_str})
 
 
-# -----------------------------
+# =============================
 # GOOGLE HELPERS
-# -----------------------------
+# =============================
 def exchange_code_for_tokens(code: str) -> Dict[str, Any]:
     payload = {"code": code, "client_id": GOOGLE_CLIENT_ID, "client_secret": GOOGLE_CLIENT_SECRET, "redirect_uri": GOOGLE_REDIRECT_URL, "grant_type": "authorization_code"}
     r = requests.post(GOOGLE_TOKEN_URL, data=payload, timeout=30)
@@ -445,81 +419,32 @@ def fetch_calendar_list(access_token: str) -> List[Dict[str, Any]]:
     return r.json().get("items", [])
 
 
-def verify_slot_is_free(
-    access_token: str,
-    calendar_ids: List[str],
-    start_utc: datetime,
-    end_utc: datetime,
-    tz_name: str
-) -> Dict[str, Any]:
-    """
-    Multi-calendar check using freeBusy.
-    Never raises. Always returns JSON.
-    """
-    body = {
-        "timeMin": iso_z(start_utc),
-        "timeMax": iso_z(end_utc),
-        "timeZone": tz_name,
-        "items": [{"id": cid} for cid in calendar_ids],
-    }
-
+def verify_slot_is_free(access_token: str, calendar_ids: List[str], start_utc: datetime, end_utc: datetime, tz_name: str) -> Dict[str, Any]:
+    body = {"timeMin": iso_z(start_utc), "timeMax": iso_z(end_utc), "timeZone": tz_name, "items": [{"id": cid} for cid in calendar_ids]}
     try:
-        r = requests.post(
-            GOOGLE_FREEBUSY_URL,
-            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-            data=json.dumps(body),
-            timeout=30,
-        )
+        r = requests.post(GOOGLE_FREEBUSY_URL, headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, data=json.dumps(body), timeout=30)
     except Exception as e:
         return {"ok": False, "slotFree": False, "busy": [], "error": f"freebusy_request_failed: {repr(e)}"}
 
     if r.status_code != 200:
-        return {
-            "ok": False,
-            "slotFree": False,
-            "busy": [],
-            "error": "freebusy_http_error",
-            "statusCode": r.status_code,
-            "googleResponseText": r.text,
-        }
+        return {"ok": False, "slotFree": False, "busy": [], "error": "freebusy_http_error", "statusCode": r.status_code, "googleResponseText": r.text}
 
     data = r.json()
     calendars_obj = data.get("calendars", {})
-
-    busy_out = []
-    slot_free = True
-
+    busy_out, slot_free = [], True
     for cal_id, cal_info in calendars_obj.items():
         cal_busy = cal_info.get("busy", []) or []
         if cal_busy:
             slot_free = False
         busy_out.append({"calendarId": cal_id, "busy": cal_busy})
-
     return {"ok": True, "slotFree": slot_free, "busy": busy_out, "checkedCalendars": calendar_ids}
 
 
 def list_events_overlap(access_token: str, calendar_id: str, start_utc: datetime, end_utc: datetime) -> Dict[str, Any]:
-    """
-    Strict single-calendar overlap check using events.list.
-    Catches events marked as 'Free' that freeBusy might not block.
-    Never raises. Always returns JSON.
-    """
-    url = GOOGLE_EVENTS_URL.format(calendarId=calendar_id)
-    params = {
-        "timeMin": iso_z(start_utc),
-        "timeMax": iso_z(end_utc),
-        "singleEvents": "true",
-        "orderBy": "startTime",
-        "maxResults": "50",
-    }
-
+    url = GOOGLE_EVENTS_URL.format(calendarId=safe_cal_id(calendar_id))
+    params = {"timeMin": iso_z(start_utc), "timeMax": iso_z(end_utc), "singleEvents": "true", "orderBy": "startTime", "maxResults": "50"}
     try:
-        r = requests.get(
-            url,
-            headers={"Authorization": f"Bearer {access_token}"},
-            params=params,
-            timeout=30,
-        )
+        r = requests.get(url, headers={"Authorization": f"Bearer {access_token}"}, params=params, timeout=30)
     except Exception as e:
         return {"ok": False, "overlap": True, "error": f"events_list_request_failed: {repr(e)}"}
 
@@ -528,61 +453,40 @@ def list_events_overlap(access_token: str, calendar_id: str, start_utc: datetime
 
     data = r.json()
     items = data.get("items", []) or []
-
     overlaps = []
     for ev in items:
         if ev.get("status") == "cancelled":
             continue
-        overlaps.append({
-            "id": ev.get("id"),
-            "summary": ev.get("summary"),
-            "start": ev.get("start"),
-            "end": ev.get("end"),
-            "transparency": ev.get("transparency"),
-        })
-
+        overlaps.append({"id": ev.get("id"), "summary": ev.get("summary"), "start": ev.get("start"), "end": ev.get("end"), "transparency": ev.get("transparency")})
     return {"ok": True, "overlap": len(overlaps) > 0, "events": overlaps}
 
 
-# -----------------------------
-# CUSTOMER SETTINGS ROUTE
-# -----------------------------
+# =============================
+# SETTINGS
+# =============================
 @app.post("/customer/settings")
 async def set_customer_settings(payload: Dict[str, Any]):
     require_env()
-
     customer_id = payload.get("customerId")
     if not customer_id:
         raise HTTPException(status_code=400, detail="Missing customerId.")
-
     tz_name = payload.get("timeZone", "America/Denver")
     ws = int(payload.get("workStartHour", 9))
     we = int(payload.get("workEndHour", 17))
-    days = payload.get("workDays", [0, 1, 2, 3, 4])  # Mon-Fri
-
-    if ws < 0 or ws > 23 or we < 1 or we > 24 or we <= ws:
-        raise HTTPException(status_code=400, detail="Invalid working hours. Example: start 9 end 17.")
-    if not isinstance(days, list) or not all(isinstance(d, int) and 0 <= d <= 6 for d in days):
-        raise HTTPException(status_code=400, detail="workDays must be list of ints (Mon=0..Sun=6).")
-
-    try:
-        ZoneInfo(tz_name)
-    except Exception:
-        raise HTTPException(status_code=400, detail=f"Invalid timeZone: {tz_name}")
-
+    days = payload.get("workDays", [0, 1, 2, 3, 4])
+    ZoneInfo(tz_name)  # validate
     set_customer_settings_db(customer_id, tz_name, ws, we, days)
     return {"customerId": customer_id, "saved": True}
 
 
-# -----------------------------
+# =============================
 # OAUTH
-# -----------------------------
+# =============================
 @app.get("/oauth/google/start")
 def google_oauth_start(customerId: str = Query(...)):
     require_env()
     state = secrets.token_urlsafe(24)
     save_state(state, customerId)
-
     params = {
         "client_id": GOOGLE_CLIENT_ID,
         "redirect_uri": GOOGLE_REDIRECT_URL,
@@ -599,7 +503,6 @@ def google_oauth_start(customerId: str = Query(...)):
 @app.get("/oauth/google/callback")
 def google_oauth_callback(code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
     require_env()
-
     if error:
         raise HTTPException(status_code=400, detail=f"Google OAuth error: {error}")
     if not code or not state:
@@ -614,12 +517,10 @@ def google_oauth_callback(code: Optional[str] = None, state: Optional[str] = Non
     refresh_token = tokens.get("refresh_token")
     scope = tokens.get("scope", "")
     token_type = tokens.get("token_type", "")
-
     if not access_token:
         raise HTTPException(status_code=400, detail=f"No access_token returned: {tokens}")
 
     user_email = get_user_email(access_token)
-
     if not refresh_token:
         existing = load_refresh_token(customer_id)
         if not existing:
@@ -627,24 +528,18 @@ def google_oauth_callback(code: Optional[str] = None, state: Optional[str] = Non
         refresh_token = existing
 
     upsert_refresh_token(customer_id, refresh_token, scope, token_type, user_email)
-
     calendars = fetch_calendar_list(access_token)
     store_calendars(customer_id, calendars)
 
     s = get_customer_settings(customer_id)
     set_customer_settings_db(customer_id, s["timezone"], s["work_start_hour"], s["work_end_hour"], s["work_days"])
 
-    return {
-        "connected": True,
-        "customerId": customer_id,
-        "email": user_email,
-        "message": "Google connected and calendars synced. Next: /google/calendars -> /google/calendars/select -> /google/availability",
-    }
+    return {"connected": True, "customerId": customer_id, "email": user_email, "message": "Google connected and calendars synced."}
 
 
-# -----------------------------
-# CALENDAR LIST / SYNC / SELECT
-# -----------------------------
+# =============================
+# CALENDARS
+# =============================
 @app.get("/google/calendars")
 def google_calendars(customerId: str = Query(...)):
     require_env()
@@ -655,17 +550,7 @@ def google_calendars(customerId: str = Query(...)):
             WHERE provider='google' AND customer_id=:cid
             ORDER BY primary_cal DESC, summary NULLS LAST, calendar_id
         """), {"cid": customerId}).fetchall()
-
-    return [
-        {
-            "calendarId": r[0],
-            "summary": r[1],
-            "accessRole": r[2],
-            "primary": bool(r[3]),
-            "selected": bool(r[4]),
-        }
-        for r in rows
-    ]
+    return [{"calendarId": r[0], "summary": r[1], "accessRole": r[2], "primary": bool(r[3]), "selected": bool(r[4])} for r in rows]
 
 
 @app.post("/google/calendars/sync")
@@ -674,11 +559,9 @@ async def google_calendars_sync(payload: Dict[str, Any]):
     customer_id = payload.get("customerId")
     if not customer_id:
         raise HTTPException(status_code=400, detail="Missing customerId.")
-
     rt = load_refresh_token(customer_id)
     if not rt:
         raise HTTPException(status_code=401, detail="Customer not connected.")
-
     access_token = refresh_access_token(rt)
     calendars = fetch_calendar_list(access_token)
     store_calendars(customer_id, calendars)
@@ -690,7 +573,6 @@ async def google_calendars_select(payload: Dict[str, Any]):
     require_env()
     customer_id = payload.get("customerId")
     calendar_ids = payload.get("calendarIds")
-
     if not customer_id:
         raise HTTPException(status_code=400, detail="Missing customerId.")
     if not isinstance(calendar_ids, list):
@@ -700,25 +582,20 @@ async def google_calendars_select(payload: Dict[str, Any]):
         raise HTTPException(status_code=400, detail="calendarIds must contain at least one id.")
 
     with engine.begin() as conn:
-        conn.execute(text("""
-            UPDATE customer_calendars
-            SET selected = FALSE
-            WHERE provider='google' AND customer_id=:cid
-        """), {"cid": customer_id})
-
+        conn.execute(text("UPDATE customer_calendars SET selected=FALSE WHERE provider='google' AND customer_id=:cid"), {"cid": customer_id})
         for cid in calendar_ids:
             conn.execute(text("""
                 UPDATE customer_calendars
-                SET selected = TRUE
+                SET selected=TRUE
                 WHERE provider='google' AND customer_id=:cid AND calendar_id=:calid
             """), {"cid": customer_id, "calid": cid})
 
     return {"customerId": customer_id, "selectedCalendarIds": calendar_ids}
 
 
-# -----------------------------
-# AVAILABILITY (DST SAFE)
-# -----------------------------
+# =============================
+# AVAILABILITY
+# =============================
 @app.post("/google/availability")
 async def google_availability(payload: Dict[str, Any]):
     require_env()
@@ -729,25 +606,18 @@ async def google_availability(payload: Dict[str, Any]):
     duration_minutes = int(payload.get("durationMinutes", 60))
     step_minutes = int(payload.get("stepMinutes", 30))
     days = int(payload.get("days", 7))
-
-    if duration_minutes <= 0:
-        raise HTTPException(status_code=400, detail="durationMinutes must be > 0.")
-    if step_minutes <= 0:
-        raise HTTPException(status_code=400, detail="stepMinutes must be > 0.")
-    if days <= 0 or days > 31:
-        raise HTTPException(status_code=400, detail="days must be 1..31.")
+    if duration_minutes <= 0 or step_minutes <= 0 or days <= 0 or days > 31:
+        raise HTTPException(status_code=400, detail="Invalid durationMinutes/stepMinutes/days.")
 
     rt = load_refresh_token(customer_id)
     if not rt:
         raise HTTPException(status_code=401, detail="Customer not connected.")
 
     settings = get_customer_settings(customer_id)
-
     tz_name = payload.get("timeZone", settings["timezone"])
     work_start = int(payload.get("workStartHour", settings["work_start_hour"]))
     work_end = int(payload.get("workEndHour", settings["work_end_hour"]))
     work_days = payload.get("workDays", settings["work_days"])
-
     tz = ZoneInfo(tz_name)
 
     access_token = refresh_access_token(rt)
@@ -766,24 +636,11 @@ async def google_availability(payload: Dict[str, Any]):
     time_min_utc = start_local.astimezone(timezone.utc)
     time_max_utc = end_local.astimezone(timezone.utc)
 
-    google_body = {
-        "timeMin": iso_z(time_min_utc),
-        "timeMax": iso_z(time_max_utc),
-        "timeZone": tz_name,
-        "items": [{"id": cid} for cid in calendar_ids],
-    }
+    google_body = {"timeMin": iso_z(time_min_utc), "timeMax": iso_z(time_max_utc), "timeZone": tz_name, "items": [{"id": cid} for cid in calendar_ids]}
 
-    r = requests.post(
-        GOOGLE_FREEBUSY_URL,
-        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-        data=json.dumps(google_body),
-        timeout=30,
-    )
+    r = requests.post(GOOGLE_FREEBUSY_URL, headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, data=json.dumps(google_body), timeout=30)
     if r.status_code != 200:
-        return JSONResponse(
-            {"ok": False, "reason": "freebusy_failed", "statusCode": r.status_code, "googleResponseText": r.text, "requestBody": google_body},
-            status_code=400,
-        )
+        return JSONResponse({"ok": False, "reason": "freebusy_failed", "statusCode": r.status_code, "googleResponseText": r.text, "requestBody": google_body}, status_code=400)
 
     fb = r.json()
     calendars_obj = fb.get("calendars", {})
@@ -791,8 +648,7 @@ async def google_availability(payload: Dict[str, Any]):
     busy_intervals = []
     for _, info in calendars_obj.items():
         for b in info.get("busy", []):
-            s = b.get("start")
-            e = b.get("end")
+            s, e = b.get("start"), b.get("end")
             if not s or not e:
                 continue
             s_utc = parse_iso_to_utc(s)
@@ -801,7 +657,6 @@ async def google_availability(payload: Dict[str, Any]):
                 busy_intervals.append({"start": s_utc, "end": e_utc})
 
     busy_merged = merge_intervals(busy_intervals)
-
     dur = timedelta(minutes=duration_minutes)
     available = []
 
@@ -831,143 +686,134 @@ async def google_availability(payload: Dict[str, Any]):
 
         cur_day = (day0_local + timedelta(days=1)).date()
 
-    return {
-        "ok": True,
-        "customerId": customer_id,
-        "timeZone": tz_name,
-        "calendarIdsUsed": calendar_ids,
-        "availableCount": len(available),
-        "suggestions": available[:3],
-        "available": available[:500],
-    }
+    return {"ok": True, "customerId": customer_id, "timeZone": tz_name, "calendarIdsUsed": calendar_ids, "availableCount": len(available), "suggestions": available[:3], "available": available[:500]}
 
 
-# -----------------------------
-# CREATE / CANCEL / RESCHEDULE EVENT
-# -----------------------------
+# =============================
+# CREATE / CANCEL / RESCHEDULE (NO DOUBLE BOOK)
+# =============================
 @app.post("/google/create_event")
 async def google_create_event(payload: Dict[str, Any]):
-    require_env()
+    try:
+        require_env()
 
-    customer_id = payload.get("customerId")
-    if not customer_id:
-        return JSONResponse({"booked": False, "reason": "missing_customerId"}, status_code=400)
+        customer_id = payload.get("customerId")
+        if not customer_id:
+            return JSONResponse({"booked": False, "reason": "missing_customerId"}, status_code=400)
 
-    rt = load_refresh_token(customer_id)
-    if not rt:
-        return JSONResponse({"booked": False, "reason": "not_connected"}, status_code=401)
+        rt = load_refresh_token(customer_id)
+        if not rt:
+            return JSONResponse({"booked": False, "reason": "not_connected"}, status_code=401)
 
-    access_token = refresh_access_token(rt)
+        access_token = refresh_access_token(rt)
 
-    calendar_id = payload.get("calendarId", "primary")
-    url = GOOGLE_EVENTS_URL.format(calendarId=calendar_id)
+        calendar_id = payload.get("calendarId", "primary")
+        url = GOOGLE_EVENTS_URL.format(calendarId=safe_cal_id(calendar_id))
 
-    start_obj = payload.get("start")
-    end_obj = payload.get("end")
-    if not start_obj or not end_obj or not start_obj.get("dateTime") or not end_obj.get("dateTime"):
-        return JSONResponse({"booked": False, "reason": "missing_start_end"}, status_code=400)
+        start_obj = payload.get("start")
+        end_obj = payload.get("end")
+        if not start_obj or not end_obj or not start_obj.get("dateTime") or not end_obj.get("dateTime"):
+            return JSONResponse({"booked": False, "reason": "missing_start_end"}, status_code=400)
 
-    settings = get_customer_settings(customer_id)
-    tz_name = settings["timezone"]
-    tz = ZoneInfo(tz_name)
+        settings = get_customer_settings(customer_id)
+        tz_name = settings["timezone"]
+        tz = ZoneInfo(tz_name)
 
-    start_utc = parse_iso_assume_tz(start_obj["dateTime"], tz)
-    end_utc = parse_iso_assume_tz(end_obj["dateTime"], tz)
+        start_utc = parse_iso_assume_tz(start_obj["dateTime"], tz)
+        end_utc = parse_iso_assume_tz(end_obj["dateTime"], tz)
 
-    selected = load_selected_calendar_ids(customer_id) or []
-    calendars_to_check = sorted(set(selected + [calendar_id] + (["primary"] if calendar_id != "primary" else [])))
+        selected = load_selected_calendar_ids(customer_id) or []
+        calendars_to_check = sorted(set(selected + [calendar_id] + (["primary"] if calendar_id != "primary" else [])))
+        if not calendars_to_check:
+            calendars_to_check = ["primary"]
 
-    fb_check = verify_slot_is_free(access_token, calendars_to_check, start_utc, end_utc, tz_name)
-    if not fb_check.get("ok"):
-        return JSONResponse({"booked": False, "reason": "freebusy_check_failed", "debug": fb_check}, status_code=503)
-    if not fb_check.get("slotFree"):
-        return JSONResponse({"booked": False, "reason": "slot_taken", "source": "freebusy", "busy": fb_check.get("busy", [])}, status_code=409)
+        # Multi-calendar busy check
+        fb_check = verify_slot_is_free(access_token, calendars_to_check, start_utc, end_utc, tz_name)
+        if not fb_check.get("ok"):
+            return JSONResponse({"booked": False, "reason": "freebusy_check_failed", "debug": fb_check}, status_code=503)
+        if not fb_check.get("slotFree"):
+            return JSONResponse({"booked": False, "reason": "slot_taken", "source": "freebusy", "busy": fb_check.get("busy", []), "checkedCalendars": calendars_to_check}, status_code=409)
 
-    ev_check = list_events_overlap(access_token, calendar_id, start_utc, end_utc)
-    if not ev_check.get("ok"):
-        return JSONResponse({"booked": False, "reason": "events_list_failed", "debug": ev_check}, status_code=503)
-    if ev_check.get("overlap"):
-        return JSONResponse({"booked": False, "reason": "slot_taken", "source": "events_list", "overlappingEvents": ev_check.get("events", [])}, status_code=409)
+        # Strict overlap check on target calendar (catches 'Free' events too)
+        ev_check = list_events_overlap(access_token, calendar_id, start_utc, end_utc)
+        if not ev_check.get("ok"):
+            return JSONResponse({"booked": False, "reason": "events_list_failed", "debug": ev_check}, status_code=503)
+        if ev_check.get("overlap"):
+            return JSONResponse({"booked": False, "reason": "slot_taken", "source": "events_list", "overlappingEvents": ev_check.get("events", [])}, status_code=409)
 
-    event_body = {
-        "summary": payload.get("summary", "Booking"),
-        "description": payload.get("description", ""),
-        "start": start_obj,
-        "end": end_obj,
-    }
+        event_body = {"summary": payload.get("summary", "Booking"), "description": payload.get("description", ""), "start": start_obj, "end": end_obj}
+        attendees = payload.get("attendees")
+        if attendees:
+            event_body["attendees"] = attendees
 
-    attendees = payload.get("attendees")
-    if attendees:
-        event_body["attendees"] = attendees
+        r = requests.post(url, headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, data=json.dumps(event_body), timeout=30)
+        if r.status_code not in (200, 201):
+            return JSONResponse({"booked": False, "reason": "create_event_failed", "statusCode": r.status_code, "googleResponseText": r.text, "requestUrl": url, "eventBody": event_body}, status_code=400)
 
-    r = requests.post(
-        url,
-        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-        data=json.dumps(event_body),
-        timeout=30,
-    )
+        return {"booked": True, "event": r.json()}
 
-    if r.status_code not in (200, 201):
-        return JSONResponse(
-            {"booked": False, "reason": "create_event_failed", "statusCode": r.status_code, "googleResponseText": r.text},
-            status_code=400,
-        )
-
-    return {"booked": True, "event": r.json()}
+    except Exception as e:
+        import traceback
+        return JSONResponse({"booked": False, "reason": "internal_exception", "error": repr(e), "traceback": traceback.format_exc()}, status_code=500)
 
 
 @app.post("/google/cancel_event")
 async def google_cancel_event(payload: Dict[str, Any]):
-    require_env()
-    customer_id = payload.get("customerId")
-    calendar_id = payload.get("calendarId", "primary")
-    event_id = payload.get("eventId")
+    try:
+        require_env()
+        customer_id = payload.get("customerId")
+        calendar_id = payload.get("calendarId", "primary")
+        event_id = payload.get("eventId")
 
-    if not customer_id or not event_id:
-        return JSONResponse({"cancelled": False, "reason": "missing_fields"}, status_code=400)
+        if not customer_id or not event_id:
+            return JSONResponse({"cancelled": False, "reason": "missing_fields"}, status_code=400)
 
-    rt = load_refresh_token(customer_id)
-    if not rt:
-        return JSONResponse({"cancelled": False, "reason": "not_connected"}, status_code=401)
+        rt = load_refresh_token(customer_id)
+        if not rt:
+            return JSONResponse({"cancelled": False, "reason": "not_connected"}, status_code=401)
 
-    access_token = refresh_access_token(rt)
+        access_token = refresh_access_token(rt)
 
-    url = GOOGLE_EVENT_URL.format(calendarId=calendar_id, eventId=event_id)
-    r = requests.delete(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
-    if r.status_code not in (200, 204):
-        return JSONResponse({"cancelled": False, "reason": "cancel_failed", "statusCode": r.status_code, "googleResponseText": r.text}, status_code=400)
+        url = GOOGLE_EVENT_URL.format(calendarId=safe_cal_id(calendar_id), eventId=quote(event_id, safe=""))
+        r = requests.delete(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
+        if r.status_code not in (200, 204):
+            return JSONResponse({"cancelled": False, "reason": "cancel_failed", "statusCode": r.status_code, "googleResponseText": r.text}, status_code=400)
 
-    return {"cancelled": True, "calendarId": calendar_id, "eventId": event_id}
+        return {"cancelled": True, "calendarId": calendar_id, "eventId": event_id}
+
+    except Exception as e:
+        import traceback
+        return JSONResponse({"cancelled": False, "reason": "internal_exception", "error": repr(e), "traceback": traceback.format_exc()}, status_code=500)
 
 
 @app.post("/google/reschedule_event")
 async def google_reschedule_event(payload: Dict[str, Any]):
-    require_env()
-    customer_id = payload.get("customerId")
-    calendar_id = payload.get("calendarId", "primary")
-    event_id = payload.get("eventId")
-    start_obj = payload.get("start")
-    end_obj = payload.get("end")
+    try:
+        require_env()
+        customer_id = payload.get("customerId")
+        calendar_id = payload.get("calendarId", "primary")
+        event_id = payload.get("eventId")
+        start_obj = payload.get("start")
+        end_obj = payload.get("end")
 
-    if not customer_id or not event_id or not start_obj or not end_obj:
-        return JSONResponse({"rescheduled": False, "reason": "missing_fields"}, status_code=400)
+        if not customer_id or not event_id or not start_obj or not end_obj:
+            return JSONResponse({"rescheduled": False, "reason": "missing_fields"}, status_code=400)
 
-    rt = load_refresh_token(customer_id)
-    if not rt:
-        return JSONResponse({"rescheduled": False, "reason": "not_connected"}, status_code=401)
+        rt = load_refresh_token(customer_id)
+        if not rt:
+            return JSONResponse({"rescheduled": False, "reason": "not_connected"}, status_code=401)
 
-    access_token = refresh_access_token(rt)
+        access_token = refresh_access_token(rt)
 
-    url = GOOGLE_EVENT_URL.format(calendarId=calendar_id, eventId=event_id)
-    patch_body = {"start": start_obj, "end": end_obj}
+        url = GOOGLE_EVENT_URL.format(calendarId=safe_cal_id(calendar_id), eventId=quote(event_id, safe=""))
+        patch_body = {"start": start_obj, "end": end_obj}
 
-    r = requests.patch(
-        url,
-        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-        data=json.dumps(patch_body),
-        timeout=30,
-    )
-    if r.status_code not in (200, 201):
-        return JSONResponse({"rescheduled": False, "reason": "reschedule_failed", "statusCode": r.status_code, "googleResponseText": r.text}, status_code=400)
+        r = requests.patch(url, headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, data=json.dumps(patch_body), timeout=30)
+        if r.status_code not in (200, 201):
+            return JSONResponse({"rescheduled": False, "reason": "reschedule_failed", "statusCode": r.status_code, "googleResponseText": r.text}, status_code=400)
 
-    return {"rescheduled": True, "event": r.json()}
+        return {"rescheduled": True, "event": r.json()}
+
+    except Exception as e:
+        import traceback
+        return JSONResponse({"rescheduled": False, "reason": "internal_exception", "error": repr(e), "traceback": traceback.format_exc()}, status_code=500)
