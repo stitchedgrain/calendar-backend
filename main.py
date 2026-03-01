@@ -485,7 +485,52 @@ def verify_slot_is_free(
         busy_out.append({"calendarId": cal_id, "busy": cal_busy})
 
     return {"ok": True, "slotFree": slot_free, "busy": busy_out, "checkedCalendars": calendar_ids}
+def list_events_overlap(access_token: str, calendar_id: str, start_utc: datetime, end_utc: datetime) -> Dict[str, Any]:
+    """
+    Strict overlap check on ONE calendar, regardless of 'free/busy' transparency.
+    Returns structured JSON and never throws.
+    """
+    url = GOOGLE_EVENTS_URL.format(calendarId=calendar_id)
 
+    params = {
+        "timeMin": iso_z(start_utc),
+        "timeMax": iso_z(end_utc),
+        "singleEvents": "true",
+        "orderBy": "startTime",
+        "maxResults": "50",
+    }
+
+    try:
+        r = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {access_token}"},
+            params=params,
+            timeout=30,
+        )
+    except Exception as e:
+        return {"ok": False, "overlap": True, "error": f"events_list_request_failed: {repr(e)}"}
+
+    if r.status_code != 200:
+        return {"ok": False, "overlap": True, "statusCode": r.status_code, "googleResponseText": r.text}
+
+    data = r.json()
+    items = data.get("items", []) or []
+
+    # Any event returned here overlaps the timeMin/timeMax window in some way.
+    # Filter out cancelled.
+    overlaps = []
+    for ev in items:
+        if ev.get("status") == "cancelled":
+            continue
+        overlaps.append({
+            "id": ev.get("id"),
+            "summary": ev.get("summary"),
+            "start": ev.get("start"),
+            "end": ev.get("end"),
+            "transparency": ev.get("transparency"),  # can be "transparent"
+        })
+
+    return {"ok": True, "overlap": len(overlaps) > 0, "events": overlaps}
 
 # -----------------------------
 # BASIC ROUTES
