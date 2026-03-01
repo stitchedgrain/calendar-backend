@@ -942,6 +942,30 @@ async def google_create_event(payload: Dict[str, Any]):
 
     access_token = refresh_access_token(rt)
 
+# -----------------------------
+# PREVENT DOUBLE BOOKING
+# -----------------------------
+settings = get_customer_settings(customer_id)
+tz = ZoneInfo(settings["timezone"])
+
+# convert incoming times to UTC
+start_utc = parse_iso_assume_tz(start_obj["dateTime"], tz)
+end_utc = parse_iso_assume_tz(end_obj["dateTime"], tz)
+
+calendar_ids = [calendar_id]
+
+slot_free = verify_slot_is_free(access_token, calendar_ids, start_utc, end_utc, settings["timezone"])
+
+if not slot_free:
+    return JSONResponse(
+        {
+            "booked": False,
+            "reason": "slot_taken",
+            "message": "That time was just booked by someone else. Please request new availability."
+        },
+        status_code=409,
+    )
+
     calendar_id = payload.get("calendarId", "primary")
     url = GOOGLE_EVENTS_URL.format(calendarId=calendar_id)
 
