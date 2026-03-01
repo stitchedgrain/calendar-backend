@@ -894,6 +894,40 @@ async def google_availability(payload: Dict[str, Any]):
 # -----------------------------
 # CREATE / CANCEL / RESCHEDULE EVENT
 # -----------------------------
+def verify_slot_is_free(access_token: str, calendar_ids: list, start_utc: datetime, end_utc: datetime, tz_name: str) -> bool:
+    """
+    Returns True if the time slot is still free across the calendars.
+    """
+
+    body = {
+        "timeMin": iso_z(start_utc),
+        "timeMax": iso_z(end_utc),
+        "timeZone": tz_name,
+        "items": [{"id": cid} for cid in calendar_ids],
+    }
+
+    r = requests.post(
+        GOOGLE_FREEBUSY_URL,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        },
+        data=json.dumps(body),
+        timeout=30,
+    )
+
+    if r.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"FreeBusy recheck failed: {r.text}")
+
+    data = r.json()
+
+    for cal_id, cal_info in data.get("calendars", {}).items():
+        busy_list = cal_info.get("busy", [])
+        if busy_list:
+            # ANY busy block means someone just booked it
+            return False
+
+    return True
 @app.post("/google/create_event")
 async def google_create_event(payload: Dict[str, Any]):
     require_env()
