@@ -1,6 +1,7 @@
 import os
 import json
 import secrets
+import re
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlencode, quote
 from datetime import datetime, timezone, timedelta
@@ -67,14 +68,38 @@ def make_engine():
 
 
 def parse_iso_to_utc(s: str) -> datetime:
+    """RFC3339 with offset or Z required."""
     dt = datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
     if dt.tzinfo is None:
         raise HTTPException(status_code=400, detail=f"Datetime missing timezone/offset: {s}")
     return dt.astimezone(timezone.utc)
 
 
+_ISO_FIX = re.compile(r"^(?P<y>\d{4})-(?P<m>\d{1,2})-(?P<d>\d{1,2})T(?P<rest>.+)$")
+
+
 def parse_iso_assume_tz(s: str, tz: ZoneInfo) -> datetime:
-    raw = s.strip()
+    """
+    Accepts:
+      - "2026-2-2T14:00:00-07:00" (normalized)
+      - "2026-02-02T14:00:00-07:00"
+      - "2026-02-02T21:00:00Z"
+      - "2026-02-02T14:00:00" (naive -> assumes tz)
+    Returns UTC datetime.
+    """
+    raw = (s or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty datetime string.")
+
+    # Normalize single-digit month/day
+    m = _ISO_FIX.match(raw)
+    if m:
+        y = m.group("y")
+        mo = int(m.group("m"))
+        d = int(m.group("d"))
+        rest = m.group("rest")
+        raw = f"{y}-{mo:02d}-{d:02d}T{rest}"
+
     dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=tz)
@@ -129,21 +154,7 @@ def format_local(dt_utc: datetime, tz: ZoneInfo) -> str:
     return dt_utc.astimezone(tz).strftime("%a %b %d, %Y %I:%M %p %Z")
 
 
-def weekday_name_to_int(name: str) -> Optional[int]:
-    m = {
-        "monday": 0, "mon": 0,
-        "tuesday": 1, "tue": 1, "tues": 1,
-        "wednesday": 2, "wed": 2,
-        "thursday": 3, "thu": 3, "thur": 3, "thurs": 3,
-        "friday": 4, "fri": 4,
-        "saturday": 5, "sat": 5,
-        "sunday": 6, "sun": 6,
-    }
-    return m.get((name or "").strip().lower())
-
-
 def safe_cal_id(cid: str) -> str:
-    # Must URL-encode calendar IDs like someone@group.calendar.google.com
     return quote(cid, safe="")
 
 
@@ -272,10 +283,7 @@ def save_state(state: str, customer_id: str):
 
 def consume_state(state: str) -> Optional[str]:
     with engine.begin() as conn:
-        row = conn.execute(
-            text("SELECT customer_id FROM oauth_states WHERE state=:state"),
-            {"state": state},
-        ).fetchone()
+        row = conn.execute(text("SELECT customer_id FROM oauth_states WHERE state=:state"), {"state": state}).fetchone()
         if not row:
             return None
         customer_id = row[0]
@@ -302,11 +310,7 @@ def upsert_refresh_token(customer_id: str, refresh_token: str, scope: str, token
 def load_refresh_token(customer_id: str) -> Optional[str]:
     with engine.begin() as conn:
         row = conn.execute(
-            text("""
-                SELECT refresh_token
-                FROM oauth_tokens
-                WHERE provider='google' AND customer_id=:customer_id
-            """),
+            text("SELECT refresh_token FROM oauth_tokens WHERE provider='google' AND customer_id=:customer_id"),
             {"customer_id": customer_id},
         ).fetchone()
         return row[0] if row else None
@@ -361,7 +365,6 @@ def get_customer_settings(customer_id: str) -> Dict[str, Any]:
         days = [int(x.strip()) for x in (days_str or "").split(",") if x.strip()]
     except Exception:
         days = [0, 1, 2, 3, 4]
-
     return {"timezone": tz_name or "America/Denver", "work_start_hour": int(ws), "work_end_hour": int(we), "work_days": days or [0, 1, 2, 3, 4]}
 
 
@@ -383,7 +386,13 @@ def set_customer_settings_db(customer_id: str, tz_name: str, ws: int, we: int, d
 # GOOGLE HELPERS
 # =============================
 def exchange_code_for_tokens(code: str) -> Dict[str, Any]:
-    payload = {"code": code, "client_id": GOOGLE_CLIENT_ID, "client_secret": GOOGLE_CLIENT_SECRET, "redirect_uri": GOOGLE_REDIRECT_URL, "grant_type": "authorization_code"}
+    payload = {
+        "code": code,
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "redirect_uri": GOOGLE_REDIRECT_URL,
+        "grant_type": "authorization_code",
+    }
     r = requests.post(GOOGLE_TOKEN_URL, data=payload, timeout=30)
     if r.status_code != 200:
         raise HTTPException(status_code=400, detail=f"Token exchange failed: {r.text}")
@@ -391,7 +400,12 @@ def exchange_code_for_tokens(code: str) -> Dict[str, Any]:
 
 
 def refresh_access_token(refresh_token: str) -> str:
-    payload = {"client_id": GOOGLE_CLIENT_ID, "client_secret": GOOGLE_CLIENT_SECRET, "refresh_token": refresh_token, "grant_type": "refresh_token"}
+    payload = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    }
     r = requests.post(GOOGLE_TOKEN_URL, data=payload, timeout=30)
     if r.status_code != 200:
         raise HTTPException(status_code=400, detail=f"Token refresh failed: {r.text}")
@@ -420,9 +434,19 @@ def fetch_calendar_list(access_token: str) -> List[Dict[str, Any]]:
 
 
 def verify_slot_is_free(access_token: str, calendar_ids: List[str], start_utc: datetime, end_utc: datetime, tz_name: str) -> Dict[str, Any]:
-    body = {"timeMin": iso_z(start_utc), "timeMax": iso_z(end_utc), "timeZone": tz_name, "items": [{"id": cid} for cid in calendar_ids]}
+    body = {
+        "timeMin": iso_z(start_utc),
+        "timeMax": iso_z(end_utc),
+        "timeZone": tz_name,
+        "items": [{"id": cid} for cid in calendar_ids],
+    }
     try:
-        r = requests.post(GOOGLE_FREEBUSY_URL, headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, data=json.dumps(body), timeout=30)
+        r = requests.post(
+            GOOGLE_FREEBUSY_URL,
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            data=json.dumps(body),
+            timeout=30,
+        )
     except Exception as e:
         return {"ok": False, "slotFree": False, "busy": [], "error": f"freebusy_request_failed: {repr(e)}"}
 
@@ -690,7 +714,7 @@ async def google_availability(payload: Dict[str, Any]):
 
 
 # =============================
-# CREATE / CANCEL / RESCHEDULE (NO DOUBLE BOOK)
+# CREATE / CANCEL / RESCHEDULE
 # =============================
 @app.post("/google/create_event")
 async def google_create_event(payload: Dict[str, Any]):
@@ -727,21 +751,25 @@ async def google_create_event(payload: Dict[str, Any]):
         if not calendars_to_check:
             calendars_to_check = ["primary"]
 
-        # Multi-calendar busy check
         fb_check = verify_slot_is_free(access_token, calendars_to_check, start_utc, end_utc, tz_name)
         if not fb_check.get("ok"):
             return JSONResponse({"booked": False, "reason": "freebusy_check_failed", "debug": fb_check}, status_code=503)
         if not fb_check.get("slotFree"):
             return JSONResponse({"booked": False, "reason": "slot_taken", "source": "freebusy", "busy": fb_check.get("busy", []), "checkedCalendars": calendars_to_check}, status_code=409)
 
-        # Strict overlap check on target calendar (catches 'Free' events too)
         ev_check = list_events_overlap(access_token, calendar_id, start_utc, end_utc)
         if not ev_check.get("ok"):
             return JSONResponse({"booked": False, "reason": "events_list_failed", "debug": ev_check}, status_code=503)
         if ev_check.get("overlap"):
             return JSONResponse({"booked": False, "reason": "slot_taken", "source": "events_list", "overlappingEvents": ev_check.get("events", [])}, status_code=409)
 
-        event_body = {"summary": payload.get("summary", "Booking"), "description": payload.get("description", ""), "start": start_obj, "end": end_obj}
+        event_body = {
+            "summary": payload.get("summary", "Booking"),
+            "description": payload.get("description", ""),
+            "start": start_obj,
+            "end": end_obj,
+        }
+
         attendees = payload.get("attendees")
         if attendees:
             event_body["attendees"] = attendees
