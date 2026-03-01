@@ -195,7 +195,6 @@ def init_db():
             );
         """))
 
-        # Backfill for older tables created without access_role
         conn.execute(text("""
             ALTER TABLE customer_calendars
             ADD COLUMN IF NOT EXISTS access_role TEXT;
@@ -452,6 +451,40 @@ def fetch_calendar_list(access_token: str) -> List[Dict[str, Any]]:
     return r.json().get("items", [])
 
 
+def verify_slot_is_free(
+    access_token: str,
+    calendar_ids: List[str],
+    start_utc: datetime,
+    end_utc: datetime,
+    tz_name: str
+) -> bool:
+    """
+    Re-check free/busy for this exact slot right before booking.
+    Returns True if slot is still free across the calendars.
+    """
+    body = {
+        "timeMin": iso_z(start_utc),
+        "timeMax": iso_z(end_utc),
+        "timeZone": tz_name,
+        "items": [{"id": cid} for cid in calendar_ids],
+    }
+
+    r = requests.post(
+        GOOGLE_FREEBUSY_URL,
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+        data=json.dumps(body),
+        timeout=30,
+    )
+    if r.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"FreeBusy recheck failed: {r.text}")
+
+    data = r.json()
+    for _, cal_info in data.get("calendars", {}).items():
+        if cal_info.get("busy"):
+            return False
+    return True
+
+
 # -----------------------------
 # BASIC ROUTES
 # -----------------------------
@@ -479,7 +512,7 @@ async def set_customer_settings(payload: Dict[str, Any]):
     tz_name = payload.get("timeZone", "America/Denver")
     ws = int(payload.get("workStartHour", 9))
     we = int(payload.get("workEndHour", 17))
-    days = payload.get("workDays", [0, 1, 2, 3, 4])  # Mon-Fri (python weekday)
+    days = payload.get("workDays", [0, 1, 2, 3, 4])  # Mon-Fri
 
     if ws < 0 or ws > 23 or we < 1 or we > 24 or we <= ws:
         raise HTTPException(status_code=400, detail="Invalid working hours. Example: start 9 end 17.")
@@ -700,9 +733,7 @@ async def google_availability(payload: Dict[str, Any]):
     if not calendar_ids:
         calendar_ids = load_selected_calendar_ids(customer_id) or ["primary"]
 
-    # -----------------------------
     # RANGE: if timeMin/timeMax provided, use them; else use now->now+days
-    # -----------------------------
     time_min_str = payload.get("timeMin")
     time_max_str = payload.get("timeMax")
 
@@ -894,40 +925,6 @@ async def google_availability(payload: Dict[str, Any]):
 # -----------------------------
 # CREATE / CANCEL / RESCHEDULE EVENT
 # -----------------------------
-def verify_slot_is_free(access_token: str, calendar_ids: list, start_utc: datetime, end_utc: datetime, tz_name: str) -> bool:
-    """
-    Returns True if the time slot is still free across the calendars.
-    """
-
-    body = {
-        "timeMin": iso_z(start_utc),
-        "timeMax": iso_z(end_utc),
-        "timeZone": tz_name,
-        "items": [{"id": cid} for cid in calendar_ids],
-    }
-
-    r = requests.post(
-        GOOGLE_FREEBUSY_URL,
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
-        },
-        data=json.dumps(body),
-        timeout=30,
-    )
-
-    if r.status_code != 200:
-        raise HTTPException(status_code=400, detail=f"FreeBusy recheck failed: {r.text}")
-
-    data = r.json()
-
-    for cal_id, cal_info in data.get("calendars", {}).items():
-        busy_list = cal_info.get("busy", [])
-        if busy_list:
-            # ANY busy block means someone just booked it
-            return False
-
-    return True
 @app.post("/google/create_event")
 async def google_create_event(payload: Dict[str, Any]):
     require_env()
@@ -942,37 +939,36 @@ async def google_create_event(payload: Dict[str, Any]):
 
     access_token = refresh_access_token(rt)
 
-# -----------------------------
-# PREVENT DOUBLE BOOKING
-# -----------------------------
-settings = get_customer_settings(customer_id)
-tz = ZoneInfo(settings["timezone"])
-
-# convert incoming times to UTC
-start_utc = parse_iso_assume_tz(start_obj["dateTime"], tz)
-end_utc = parse_iso_assume_tz(end_obj["dateTime"], tz)
-
-calendar_ids = [calendar_id]
-
-slot_free = verify_slot_is_free(access_token, calendar_ids, start_utc, end_utc, settings["timezone"])
-
-if not slot_free:
-    return JSONResponse(
-        {
-            "booked": False,
-            "reason": "slot_taken",
-            "message": "That time was just booked by someone else. Please request new availability."
-        },
-        status_code=409,
-    )
-
     calendar_id = payload.get("calendarId", "primary")
     url = GOOGLE_EVENTS_URL.format(calendarId=calendar_id)
 
     start_obj = payload.get("start")
     end_obj = payload.get("end")
-    if not start_obj or not end_obj:
-        raise HTTPException(status_code=400, detail="Missing start/end objects.")
+    if not start_obj or not end_obj or not start_obj.get("dateTime") or not end_obj.get("dateTime"):
+        raise HTTPException(status_code=400, detail="Missing start/end.dateTime objects.")
+
+    # -----------------------------
+    # PREVENT DOUBLE BOOKING (re-check slot right before insert)
+    # -----------------------------
+    settings = get_customer_settings(customer_id)
+    tz_name = settings["timezone"]
+    tz = ZoneInfo(tz_name)
+
+    start_utc = parse_iso_assume_tz(start_obj["dateTime"], tz)
+    end_utc = parse_iso_assume_tz(end_obj["dateTime"], tz)
+
+    # Recheck on the same calendar we are inserting into (and you can expand this list later if desired)
+    calendars_to_check = [calendar_id]
+
+    if not verify_slot_is_free(access_token, calendars_to_check, start_utc, end_utc, tz_name):
+        return JSONResponse(
+            {
+                "booked": False,
+                "reason": "slot_taken",
+                "message": "That time was just booked by someone else. Please request new availability."
+            },
+            status_code=409,
+        )
 
     event_body = {
         "summary": payload.get("summary", "Booking"),
