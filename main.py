@@ -4,13 +4,13 @@ import os
 import json
 import secrets
 import urllib.parse
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import create_engine, text
@@ -57,9 +57,8 @@ def make_engine() -> Engine:
     - normalizes scheme to SQLAlchemy + psycopg v3 driver
     """
     raw = (os.environ.get("DATABASE_URL") or "").strip()
-
     if not raw:
-        raise RuntimeError("DATABASE_URL env var is missing/empty in Render")
+        raise RuntimeError("DATABASE_URL env var is missing/empty")
 
     # remove wrapping quotes if user pasted them
     if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
@@ -73,9 +72,8 @@ def make_engine() -> Engine:
     elif raw.startswith("postgresql+psycopg2://"):
         raw = raw.replace("postgresql+psycopg2://", "postgresql+psycopg://", 1)
 
-    # minimal sanity check (don’t leak creds)
     if "://" not in raw:
-        raise RuntimeError(f"DATABASE_URL malformed (prefix={raw[:20]!r})")
+        raise RuntimeError("DATABASE_URL malformed (missing scheme)")
 
     return create_engine(raw, pool_pre_ping=True, future=True)
 
@@ -160,9 +158,19 @@ def parse_iso_to_utc(raw: str) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
-def parse_local_naive_assume_tz(raw: str, tz_name: str) -> datetime:
+def parse_any_datetime_to_utc(raw: str, tz_name: str) -> datetime:
+    """
+    Accepts:
+      - ISO with Z or offset: 2026-02-02T21:00:00Z / 2026-02-02T21:00:00-07:00
+      - naive ISO: 2026-02-02T21:00:00  (assumed tz_name)
+    """
     s = (raw or "").strip()
-    dt = datetime.fromisoformat(s)  # naive
+    if not s:
+        raise ValueError("Empty datetime")
+    if s.endswith("Z") or ("+" in s[10:] or "-" in s[10:]):
+        return parse_iso_to_utc(s)
+    # naive
+    dt = datetime.fromisoformat(s)
     tz = ZoneInfo(tz_name)
     return dt.replace(tzinfo=tz).astimezone(timezone.utc)
 
@@ -193,56 +201,46 @@ def normalize_work_days(x: Any) -> List[int]:
 # -------------------------
 # Interval helpers
 # -------------------------
-def merge_intervals(intervals: List[Dict[str, datetime]]) -> List[Dict[str, datetime]]:
-    cleaned = [i for i in intervals if i["end"] > i["start"]]
+def merge_intervals_dt(intervals: List[Tuple[datetime, datetime]]) -> List[Tuple[datetime, datetime]]:
+    cleaned = [(s, e) for (s, e) in intervals if e > s]
     if not cleaned:
         return []
-    cleaned.sort(key=lambda x: x["start"])
-    out = [cleaned[0].copy()]
-    for cur in cleaned[1:]:
+    cleaned.sort(key=lambda x: x[0])
+    out: List[List[datetime]] = [[cleaned[0][0], cleaned[0][1]]]
+    for s, e in cleaned[1:]:
         last = out[-1]
-        if cur["start"] <= last["end"]:
-            last["end"] = max(last["end"], cur["end"])
+        if s <= last[1]:
+            last[1] = max(last[1], e)
         else:
-            out.append(cur.copy())
-    return out
+            out.append([s, e])
+    return [(a, b) for a, b in out]
 
 
-def subtract_busy_from_window(win_start: datetime, win_end: datetime, busy_merged: List[Dict[str, datetime]]) -> List[Dict[str, datetime]]:
-    if win_end <= win_start:
-        return []
-    free = []
-    cursor = win_start
-    for b in busy_merged:
-        if b["end"] <= cursor:
-            continue
-        if b["start"] >= win_end:
-            break
-        if b["start"] > cursor:
-            free.append({"start": cursor, "end": min(b["start"], win_end)})
-        cursor = max(cursor, b["end"])
-        if cursor >= win_end:
-            break
-    if cursor < win_end:
-        free.append({"start": cursor, "end": win_end})
-    return [f for f in free if f["end"] > f["start"]]
+def overlaps(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
+    return a_start < b_end and b_start < a_end
+
+
+def slot_is_free(slot_start: datetime, slot_end: datetime, merged_busy: List[Tuple[datetime, datetime]], start_idx: int) -> Tuple[bool, int]:
+    i = start_idx
+    while i < len(merged_busy) and merged_busy[i][1] <= slot_start:
+        i += 1
+    j = i
+    while j < len(merged_busy) and merged_busy[j][0] < slot_end:
+        bs, be = merged_busy[j]
+        if overlaps(slot_start, slot_end, bs, be):
+            return (False, i)
+        j += 1
+    return (True, i)
 
 
 def round_up_to_step(dt_utc: datetime, step_minutes: int) -> datetime:
+    dt_utc = dt_utc.astimezone(timezone.utc).replace(second=0, microsecond=0)
     if step_minutes <= 1:
-        return dt_utc.replace(second=0, microsecond=0)
-    dt_utc = dt_utc.replace(second=0, microsecond=0)
+        return dt_utc
     epoch = int(dt_utc.timestamp())
     step = step_minutes * 60
     rounded = ((epoch + step - 1) // step) * step
     return datetime.fromtimestamp(rounded, tz=timezone.utc)
-
-
-def slot_overlaps_busy(slot_start: datetime, slot_end: datetime, busy_merged: List[Dict[str, datetime]]) -> bool:
-    for b in busy_merged:
-        if slot_start < b["end"] and slot_end > b["start"]:
-            return True
-    return False
 
 
 def pick_three_suggestions(available: List[Dict[str, str]], preferred_utc: Optional[datetime]) -> List[Dict[str, str]]:
@@ -370,7 +368,12 @@ def ensure_customer_settings(customer_id: str) -> Dict[str, Any]:
             {"cid": customer_id},
         ).fetchone()
         if row:
-            return {"timezone": row[0], "work_start_hour": row[1], "work_end_hour": row[2], "work_days": normalize_work_days(row[3])}
+            return {
+                "timezone": row[0],
+                "work_start_hour": row[1],
+                "work_end_hour": row[2],
+                "work_days": normalize_work_days(row[3]),
+            }
 
         conn.execute(
             text("""
@@ -380,6 +383,34 @@ def ensure_customer_settings(customer_id: str) -> Dict[str, Any]:
             {"cid": customer_id},
         )
         return {"timezone": "America/Denver", "work_start_hour": 9, "work_end_hour": 17, "work_days": [0, 1, 2, 3, 4]}
+
+
+def update_customer_settings(customer_id: str, tz_name: str, work_start: int, work_end: int, work_days: List[int]) -> Dict[str, Any]:
+    # Validate tz
+    try:
+        ZoneInfo(tz_name)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid timeZone")
+    if not (0 <= work_start <= 23 and 0 <= work_end <= 24 and work_end > work_start):
+        raise HTTPException(status_code=400, detail="Invalid working hours")
+    if not work_days:
+        raise HTTPException(status_code=400, detail="workDays cannot be empty")
+
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO customer_settings(customer_id, timezone, work_start_hour, work_end_hour, work_days)
+                VALUES (:cid, :tz, :ws, :we, :wd)
+                ON CONFLICT (customer_id) DO UPDATE SET
+                  timezone = EXCLUDED.timezone,
+                  work_start_hour = EXCLUDED.work_start_hour,
+                  work_end_hour = EXCLUDED.work_end_hour,
+                  work_days = EXCLUDED.work_days
+            """),
+            {"cid": customer_id, "tz": tz_name, "ws": work_start, "we": work_end, "wd": json.dumps(work_days)},
+        )
+
+    return ensure_customer_settings(customer_id)
 
 
 def upsert_calendars(customer_id: str, calendars: List[Dict[str, Any]]) -> None:
@@ -397,7 +428,16 @@ def upsert_calendars(customer_id: str, calendars: List[Dict[str, Any]]) -> None:
                 continue
             primary = bool(c.get("primary", False))
             selected = True if primary else False
-            conn.execute(q, {"cid": customer_id, "calid": calid, "summary": c.get("summary"), "primary": primary, "selected": selected})
+            conn.execute(
+                q,
+                {
+                    "cid": customer_id,
+                    "calid": calid,
+                    "summary": c.get("summary"),
+                    "primary": primary,
+                    "selected": selected,
+                },
+            )
 
         count_sel = conn.execute(
             text("SELECT COUNT(*) FROM customer_calendars WHERE provider='google' AND customer_id=:cid AND selected=true"),
@@ -432,7 +472,10 @@ def set_selected_calendars(customer_id: str, calendar_ids: List[str]) -> None:
     if not calendar_ids:
         raise HTTPException(status_code=400, detail="calendarIds must not be empty")
     with engine.begin() as conn:
-        conn.execute(text("UPDATE customer_calendars SET selected=false WHERE provider='google' AND customer_id=:cid"), {"cid": customer_id})
+        conn.execute(
+            text("UPDATE customer_calendars SET selected=false WHERE provider='google' AND customer_id=:cid"),
+            {"cid": customer_id},
+        )
         conn.execute(
             text("""
                 UPDATE customer_calendars
@@ -472,7 +515,13 @@ def google_calendar_list(access_token: str) -> Dict[str, Any]:
     return {"statusCode": r.status_code, "json": safe_json(r), "text": r.text}
 
 
-def freebusy_raw(access_token: str, calendar_ids: List[str], time_min_utc: datetime, time_max_utc: datetime, time_zone: str) -> Dict[str, Any]:
+def freebusy_raw(
+    access_token: str,
+    calendar_ids: List[str],
+    time_min_utc: datetime,
+    time_max_utc: datetime,
+    time_zone: str,
+) -> Dict[str, Any]:
     body = {
         "timeMin": iso_z(time_min_utc),
         "timeMax": iso_z(time_max_utc),
@@ -488,7 +537,15 @@ def freebusy_raw(access_token: str, calendar_ids: List[str], time_min_utc: datet
     return {"statusCode": r.status_code, "json": safe_json(r), "text": r.text, "requestBody": body}
 
 
-def google_create_event_api(access_token: str, calendar_id: str, summary: str, description: str, start_utc: datetime, end_utc: datetime, tz_name: str) -> Dict[str, Any]:
+def google_create_event_api(
+    access_token: str,
+    calendar_id: str,
+    summary: str,
+    description: str,
+    start_utc: datetime,
+    end_utc: datetime,
+    tz_name: str,
+) -> Dict[str, Any]:
     tz = ZoneInfo(tz_name)
     body = {
         "summary": summary,
@@ -497,8 +554,89 @@ def google_create_event_api(access_token: str, calendar_id: str, summary: str, d
         "end": {"dateTime": end_utc.astimezone(tz).isoformat(), "timeZone": tz_name},
     }
     url = GOOGLE_EVENTS_URL.format(calendarId=safe_cal_id(calendar_id))
-    r = requests.post(url, headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, data=json.dumps(body), timeout=30)
+    r = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+        data=json.dumps(body),
+        timeout=30,
+    )
     return {"statusCode": r.status_code, "json": safe_json(r), "text": r.text, "requestBody": body}
+
+
+# -------------------------
+# Busy collection (FreeBusy + Events fallback)
+# -------------------------
+def collect_busy_utc(
+    access_token: str,
+    tz_name: str,
+    calendar_ids: List[str],
+    time_min_utc: datetime,
+    time_max_utc: datetime,
+) -> Dict[str, Any]:
+    """
+    Returns merged busy in UTC.
+    """
+    fb = freebusy_raw(access_token, calendar_ids, time_min_utc, time_max_utc, tz_name)
+
+    busy_intervals: List[Tuple[datetime, datetime]] = []
+    checked = list(calendar_ids)
+
+    if fb["statusCode"] == 200 and fb["json"]:
+        calendars_obj = fb["json"].get("calendars", {}) or {}
+        for _, info in calendars_obj.items():
+            for b in (info.get("busy") or []):
+                s, e = b.get("start"), b.get("end")
+                if not s or not e:
+                    continue
+                try:
+                    s_utc = parse_iso_to_utc(s)
+                    e_utc = parse_iso_to_utc(e)
+                    if e_utc > s_utc:
+                        busy_intervals.append((s_utc, e_utc))
+                except Exception:
+                    continue
+
+    # Events fallback: helpful when FreeBusy misses things (rare but can happen)
+    for cid in calendar_ids:
+        url = GOOGLE_EVENTS_URL.format(calendarId=safe_cal_id(cid))
+        params = {
+            "timeMin": iso_z(time_min_utc),
+            "timeMax": iso_z(time_max_utc),
+            "singleEvents": "true",
+            "orderBy": "startTime",
+            "maxResults": "2500",
+        }
+        r = requests.get(url, headers={"Authorization": f"Bearer {access_token}"}, params=params, timeout=30)
+        if r.status_code != 200:
+            continue
+        items = (r.json() or {}).get("items", []) or []
+        for ev in items:
+            if ev.get("status") == "cancelled":
+                continue
+            start = (ev.get("start") or {}).get("dateTime")
+            end = (ev.get("end") or {}).get("dateTime")
+            if not start or not end:
+                continue
+            try:
+                s_utc = parse_iso_to_utc(start)
+                e_utc = parse_iso_to_utc(end)
+                if e_utc > s_utc:
+                    busy_intervals.append((s_utc, e_utc))
+            except Exception:
+                continue
+
+    merged = merge_intervals_dt(busy_intervals)
+
+    return {
+        "ok": True,
+        "checkedCalendars": checked,
+        "timeMinUtc": iso_z(time_min_utc),
+        "timeMaxUtc": iso_z(time_max_utc),
+        "busyMerged": [{"startUtc": iso_z(s), "endUtc": iso_z(e)} for s, e in merged],
+        "freebusyStatusCode": fb["statusCode"],
+        "freebusyRequestBody": fb.get("requestBody"),
+        "freebusyResponseText": fb.get("text"),
+    }
 
 
 # -------------------------
@@ -518,94 +656,81 @@ def compute_availability(
 ) -> Dict[str, Any]:
     tz = ZoneInfo(tz_name)
     now_local = datetime.now(tz).replace(second=0, microsecond=0)
-    start_local = now_local
-    end_local = (start_local + timedelta(days=days)).replace(second=0, microsecond=0)
 
-    time_min_utc = start_local.astimezone(timezone.utc)
-    time_max_utc = end_local.astimezone(timezone.utc)
+    # IMPORTANT: horizon end must include the *end of the last day window*, not "now + N days at current time"
+    start_day = now_local.date()
+    end_day = start_day + timedelta(days=max(1, int(days)))
+    horizon_end_local = datetime(end_day.year, end_day.month, end_day.day, work_end_hour, 0, tzinfo=tz)
 
-    fb = freebusy_raw(access_token, calendar_ids, time_min_utc, time_max_utc, tz_name)
-    if fb["statusCode"] != 200 or not fb["json"]:
-        return {"ok": False, "reason": "freebusy_failed", "statusCode": fb["statusCode"], "googleResponseText": fb["text"], "requestBody": fb["requestBody"]}
+    time_min_utc = now_local.astimezone(timezone.utc)
+    time_max_utc = horizon_end_local.astimezone(timezone.utc)
 
-    busy_intervals: List[Dict[str, datetime]] = []
-    calendars_obj = fb["json"].get("calendars", {}) or {}
-    for _, info in calendars_obj.items():
-        for b in (info.get("busy") or []):
-            s, e = b.get("start"), b.get("end")
-            if not s or not e:
-                continue
-            s_utc = parse_iso_to_utc(s)
-            e_utc = parse_iso_to_utc(e)
-            if e_utc > s_utc:
-                busy_intervals.append({"start": s_utc, "end": e_utc})
+    # Collect merged busy across calendars for the horizon
+    busy_pack = collect_busy_utc(access_token, tz_name, calendar_ids, time_min_utc, time_max_utc)
+    if not busy_pack.get("ok"):
+        return {"ok": False, "reason": "busy_collect_failed"}
 
-    # Events fallback (authoritative)
-    for cid in calendar_ids:
-        url = GOOGLE_EVENTS_URL.format(calendarId=safe_cal_id(cid))
-        params = {"timeMin": iso_z(time_min_utc), "timeMax": iso_z(time_max_utc), "singleEvents": "true", "orderBy": "startTime", "maxResults": "2500"}
-        r = requests.get(url, headers={"Authorization": f"Bearer {access_token}"}, params=params, timeout=30)
-        if r.status_code != 200:
-            continue
-        items = (r.json() or {}).get("items", []) or []
-        for ev in items:
-            if ev.get("status") == "cancelled":
-                continue
-            start = (ev.get("start") or {}).get("dateTime")
-            end = (ev.get("end") or {}).get("dateTime")
-            if not start or not end:
-                continue
-            try:
-                s_utc = parse_iso_to_utc(start)
-                e_utc = parse_iso_to_utc(end)
-                if e_utc > s_utc:
-                    busy_intervals.append({"start": s_utc, "end": e_utc})
-            except Exception:
-                continue
+    merged_busy: List[Tuple[datetime, datetime]] = []
+    for it in busy_pack["busyMerged"]:
+        merged_busy.append((parse_iso_to_utc(it["startUtc"]), parse_iso_to_utc(it["endUtc"])))
+    merged_busy = merge_intervals_dt(merged_busy)
 
-    busy_merged = merge_intervals(busy_intervals)
+    dur = timedelta(minutes=int(duration_minutes))
+    step = timedelta(minutes=int(step_minutes))
 
-    dur = timedelta(minutes=duration_minutes)
     available: List[Dict[str, str]] = []
+    busy_ptr = 0
 
-    cur_day = start_local.date()
-    last_day = end_local.date()
+    for day_offset in range(int(days)):
+        d = start_day + timedelta(days=day_offset)
+        weekday = datetime(d.year, d.month, d.day, 0, 0, tzinfo=tz).weekday()
+        if weekday not in work_days:
+            continue
 
-    while cur_day <= last_day:
-        day0_local = datetime(cur_day.year, cur_day.month, cur_day.day, 0, 0, tzinfo=tz)
-        weekday = day0_local.weekday()
+        win_start_local = datetime(d.year, d.month, d.day, work_start_hour, 0, tzinfo=tz)
+        win_end_local = datetime(d.year, d.month, d.day, work_end_hour, 0, tzinfo=tz)
 
-        if weekday in work_days:
-            win_start_local = day0_local.replace(hour=work_start_hour, minute=0, second=0, microsecond=0)
-            win_end_local = day0_local.replace(hour=work_end_hour, minute=0, second=0, microsecond=0)
+        # today: don't offer times in the past
+        if d == now_local.date() and now_local > win_start_local:
+            win_start_local = now_local
 
-            if day0_local.date() == now_local.date() and now_local > win_start_local:
-                win_start_local = now_local
+        if win_end_local <= win_start_local:
+            continue
 
-            if win_end_local > win_start_local:
-                win_start_utc = win_start_local.astimezone(timezone.utc)
-                win_end_utc = win_end_local.astimezone(timezone.utc)
+        win_start_utc = win_start_local.astimezone(timezone.utc)
+        win_end_utc = win_end_local.astimezone(timezone.utc)
 
-                free_intervals = subtract_busy_from_window(win_start_utc, win_end_utc, busy_merged)
-                for fi in free_intervals:
-                    s = round_up_to_step(fi["start"], step_minutes)
-                    while s + dur <= fi["end"]:
-                        e = s + dur
-                        if not slot_overlaps_busy(s, e, busy_merged):
-                            available.append({"startUtc": iso_z(s), "endUtc": iso_z(e), "startLocal": format_local(s, tz), "endLocal": format_local(e, tz)})
-                        s = s + timedelta(minutes=step_minutes)
+        t = round_up_to_step(win_start_utc, int(step_minutes))
+        last_start = win_end_utc - dur
 
-        cur_day = (day0_local + timedelta(days=1)).date()
+        while t <= last_start:
+            slot_start = t
+            slot_end = t + dur
+
+            free, busy_ptr = slot_is_free(slot_start, slot_end, merged_busy, busy_ptr)
+            if free:
+                available.append(
+                    {
+                        "startUtc": iso_z(slot_start),
+                        "endUtc": iso_z(slot_end),
+                        "startLocal": format_local(slot_start, tz),
+                        "endLocal": format_local(slot_end, tz),
+                    }
+                )
+
+            t = t + step
 
     suggestions = pick_three_suggestions(available, preferred_utc)
+
     return {
         "ok": True,
         "timeZone": tz_name,
         "calendarIdsUsed": calendar_ids,
         "window": {"timeMinUtc": iso_z(time_min_utc), "timeMaxUtc": iso_z(time_max_utc)},
-        "busyMergedCount": len(busy_merged),
+        "busyMergedCount": len(merged_busy),
         "availableCount": len(available),
         "suggestions": suggestions,
+        # keep response manageable
         "available": available[:500],
     }
 
@@ -624,6 +749,35 @@ def debug_db(request: Request):
     with engine.begin() as conn:
         v = conn.execute(text("SELECT 1")).scalar_one()
     return {"db_ok": True, "select_1": v}
+
+
+@app.get("/debug/schema")
+def debug_schema(request: Request):
+    require_debug_key(request)
+    out: Dict[str, Any] = {"tables": []}
+    with engine.begin() as conn:
+        tables = conn.execute(
+            text("""
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema='public'
+                ORDER BY table_name
+            """)
+        ).fetchall()
+        out["tables"] = [t[0] for t in tables]
+
+        for tname in out["tables"]:
+            cols = conn.execute(
+                text("""
+                    SELECT column_name AS name, data_type AS type
+                    FROM information_schema.columns
+                    WHERE table_schema='public' AND table_name=:t
+                    ORDER BY ordinal_position
+                """),
+                {"t": tname},
+            ).fetchall()
+            out[tname] = [{"name": c[0], "type": c[1]} for c in cols]
+    return out
 
 
 @app.get("/oauth/google/start")
@@ -697,8 +851,87 @@ async def google_select_calendars(payload: Dict[str, Any]):
     return {"ok": True, "customerId": customer_id, "selected": selected_calendar_ids(customer_id)}
 
 
+@app.post("/google/settings")
+async def google_settings(payload: Dict[str, Any]):
+    """
+    Set per-customer defaults.
+    Body:
+    {
+      "customerId": "pm_1",
+      "timeZone": "America/Denver",
+      "workStartHour": 9,
+      "workEndHour": 17,
+      "workDays": [0,1,2,3,4]
+    }
+    """
+    customer_id = payload.get("customerId")
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="customerId required")
+
+    settings = ensure_customer_settings(customer_id)
+
+    tz_name = payload.get("timeZone") or settings["timezone"]
+    ws = int(payload.get("workStartHour", settings["work_start_hour"]))
+    we = int(payload.get("workEndHour", settings["work_end_hour"]))
+    wd = normalize_work_days(payload.get("workDays", settings["work_days"]))
+
+    updated = update_customer_settings(customer_id, tz_name, ws, we, wd)
+    return {"ok": True, "customerId": customer_id, "settings": updated}
+
+
+@app.post("/google/freebusy")
+async def google_freebusy(payload: Dict[str, Any]):
+    """
+    Returns merged busy across selected calendars (or calendarIds if provided).
+    Body:
+    {
+      "customerId": "pm_1",
+      "timeMinUtc": "2026-03-02T00:00:00Z",
+      "timeMaxUtc": "2026-03-10T00:00:00Z",
+      "timeZone": "America/Denver",
+      "calendarIds": ["primary", "..."]  # optional
+    }
+    """
+    customer_id = payload.get("customerId")
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="customerId required")
+
+    settings = ensure_customer_settings(customer_id)
+    tz_name = payload.get("timeZone") or settings["timezone"]
+
+    try:
+        time_min = parse_iso_to_utc(payload.get("timeMinUtc"))
+        time_max = parse_iso_to_utc(payload.get("timeMaxUtc"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="timeMinUtc and timeMaxUtc required and must be ISO (Z or offset)")
+
+    cal_ids = payload.get("calendarIds")
+    calendar_ids = cal_ids if isinstance(cal_ids, list) and cal_ids else selected_calendar_ids(customer_id)
+
+    rt = load_refresh_token(customer_id)
+    access_token = refresh_access_token(rt)
+
+    return collect_busy_utc(access_token, tz_name, calendar_ids, time_min, time_max)
+
+
 @app.post("/google/availability")
 async def google_availability(payload: Dict[str, Any]):
+    """
+    Body:
+    {
+      "customerId": "pm_1",
+      "days": 7,
+      "durationMinutes": 60,
+      "stepMinutes": 30,
+
+      "timeZone": "America/Denver",          # optional
+      "workStartHour": 9,                    # optional
+      "workEndHour": 17,                     # optional
+      "workDays": [0,1,2,3,4],               # optional
+      "calendarIds": ["primary", "..."],     # optional (else uses selected from DB)
+      "preferredDateTimeUtc": "2026-03-03T20:00:00Z"  # optional
+    }
+    """
     customer_id = payload.get("customerId")
     if not customer_id:
         raise HTTPException(status_code=400, detail="customerId required")
@@ -718,7 +951,12 @@ async def google_availability(payload: Dict[str, Any]):
     calendar_ids = cal_ids if isinstance(cal_ids, list) and cal_ids else selected_calendar_ids(customer_id)
 
     preferred_raw = payload.get("preferredDateTimeUtc")
-    preferred_utc = parse_iso_to_utc(preferred_raw) if preferred_raw else None
+    preferred_utc = None
+    if preferred_raw:
+        try:
+            preferred_utc = parse_iso_to_utc(preferred_raw)
+        except Exception:
+            return {"ok": False, "reason": "invalid_preferredDateTimeUtc", "message": "preferredDateTimeUtc must be ISO with Z or offset"}
 
     rt = load_refresh_token(customer_id)
     access_token = refresh_access_token(rt)
@@ -735,3 +973,101 @@ async def google_availability(payload: Dict[str, Any]):
         days=days,
         preferred_utc=preferred_utc,
     )
+
+
+@app.post("/google/create_event")
+async def google_create_event(payload: Dict[str, Any]):
+    """
+    Books if free; returns JSON even when slot is taken.
+
+    Body:
+    {
+      "customerId": "pm_1",
+      "calendarId": "primary",   # where to create the event
+      "summary": "...",
+      "description": "...",
+      "timeZone": "America/Denver",   # optional (defaults to customer settings)
+      "start": {"dateTime": "2026-02-02T21:00:00Z"},
+      "end":   {"dateTime": "2026-02-02T22:00:00Z"}
+    }
+    """
+    customer_id = payload.get("customerId")
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="customerId required")
+
+    settings = ensure_customer_settings(customer_id)
+    tz_name = payload.get("timeZone") or settings["timezone"]
+
+    calendar_id = (payload.get("calendarId") or "primary").strip() or "primary"
+    summary = (payload.get("summary") or "").strip() or "Appointment"
+    description = (payload.get("description") or "").strip()
+
+    start_obj = payload.get("start") or {}
+    end_obj = payload.get("end") or {}
+    raw_start = (start_obj.get("dateTime") or "").strip()
+    raw_end = (end_obj.get("dateTime") or "").strip()
+
+    try:
+        start_utc = parse_any_datetime_to_utc(raw_start, tz_name)
+        end_utc = parse_any_datetime_to_utc(raw_end, tz_name)
+    except Exception as e:
+        return {
+            "booked": False,
+            "reason": "invalid_datetime",
+            "message": "start.dateTime and end.dateTime must be valid ISO datetimes (Z/offset) or naive ISO assumed in timeZone",
+            "error": repr(e),
+        }
+
+    if end_utc <= start_utc:
+        return {"booked": False, "reason": "invalid_range", "message": "end must be after start"}
+
+    rt = load_refresh_token(customer_id)
+    access_token = refresh_access_token(rt)
+
+    # Check slot across ALL selected calendars (prevents double booking)
+    calendars_to_check = selected_calendar_ids(customer_id)
+    # Always include the target calendarId too
+    if calendar_id not in calendars_to_check:
+        calendars_to_check = [calendar_id] + calendars_to_check
+
+    # Small buffer to ensure we capture touching events precisely
+    time_min = start_utc - timedelta(minutes=1)
+    time_max = end_utc + timedelta(minutes=1)
+
+    busy_pack = collect_busy_utc(access_token, tz_name, calendars_to_check, time_min, time_max)
+    merged_busy: List[Tuple[datetime, datetime]] = []
+    for it in busy_pack["busyMerged"]:
+        merged_busy.append((parse_iso_to_utc(it["startUtc"]), parse_iso_to_utc(it["endUtc"])))
+    merged_busy = merge_intervals_dt(merged_busy)
+
+    # overlap check (true overlap; touching edges are allowed)
+    for bs, be in merged_busy:
+        if overlaps(start_utc, end_utc, bs, be):
+            return {
+                "booked": False,
+                "reason": "slot_taken",
+                "message": "That time is already booked. Please pick another slot.",
+                "source": "busy_check",
+                "checkedCalendars": calendars_to_check,
+                "busyMerged": [{"startUtc": iso_z(bs), "endUtc": iso_z(be)} for bs, be in merged_busy],
+            }
+
+    # Create event
+    created = google_create_event_api(access_token, calendar_id, summary, description, start_utc, end_utc, tz_name)
+    if created["statusCode"] not in (200, 201):
+        return {
+            "booked": False,
+            "reason": "google_create_failed",
+            "message": "Google rejected the create event request",
+            "statusCode": created["statusCode"],
+            "googleResponseText": created["text"],
+            "requestBody": created["requestBody"],
+        }
+
+    return {
+        "booked": True,
+        "calendarId": calendar_id,
+        "event": created.get("json"),
+        "startUtc": iso_z(start_utc),
+        "endUtc": iso_z(end_utc),
+    }
