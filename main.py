@@ -10,7 +10,7 @@ import requests
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
-from datetime import datetime, timedelta, timezone, date
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import create_engine, text
@@ -60,11 +60,9 @@ def make_engine() -> Engine:
     if not raw:
         raise RuntimeError("DATABASE_URL env var is missing/empty")
 
-    # remove wrapping quotes if user pasted them
     if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
         raw = raw[1:-1].strip()
 
-    # normalize common postgres URL schemes
     if raw.startswith("postgres://"):
         raw = raw.replace("postgres://", "postgresql+psycopg://", 1)
     elif raw.startswith("postgresql://"):
@@ -167,12 +165,13 @@ def parse_any_datetime_to_utc(raw: str, tz_name: str) -> datetime:
     s = (raw or "").strip()
     if not s:
         raise ValueError("Empty datetime")
-    if s.endswith("Z") or ("+" in s[10:] or "-" in s[10:]):
-        return parse_iso_to_utc(s)
-    # naive
-    dt = datetime.fromisoformat(s)
-    tz = ZoneInfo(tz_name)
-    return dt.replace(tzinfo=tz).astimezone(timezone.utc)
+
+    # Try parse; if timezone present, keep it; else assume tz_name
+    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        tz = ZoneInfo(tz_name)
+        dt = dt.replace(tzinfo=tz)
+    return dt.astimezone(timezone.utc)
 
 
 def format_local(dt_utc: datetime, tz: ZoneInfo) -> str:
@@ -254,6 +253,142 @@ def pick_three_suggestions(available: List[Dict[str, str]], preferred_utc: Optio
         return abs((s - preferred_utc).total_seconds())
 
     return sorted(available, key=dist)[:3]
+
+
+# -------------------------
+# Preference helpers
+# -------------------------
+def _weekday_name_to_int(name: str) -> Optional[int]:
+    s = (name or "").strip().lower()
+    m = {
+        "monday": 0, "mon": 0,
+        "tuesday": 1, "tue": 1, "tues": 1,
+        "wednesday": 2, "wed": 2,
+        "thursday": 3, "thu": 3, "thur": 3, "thurs": 3,
+        "friday": 4, "fri": 4,
+        "saturday": 5, "sat": 5,
+        "sunday": 6, "sun": 6,
+    }
+    return m.get(s)
+
+
+def _slot_start_local(slot: Dict[str, str], tz: ZoneInfo) -> datetime:
+    return parse_iso_to_utc(slot["startUtc"]).astimezone(tz)
+
+
+def _slot_weekday(slot: Dict[str, str], tz: ZoneInfo) -> int:
+    return _slot_start_local(slot, tz).weekday()
+
+
+def _filter_time_of_day(slots: List[Dict[str, str]], tz: ZoneInfo, tod: str) -> List[Dict[str, str]]:
+    t = (tod or "").strip().lower()
+    if t not in ("morning", "afternoon"):
+        return slots
+    out: List[Dict[str, str]] = []
+    for s in slots:
+        h = _slot_start_local(s, tz).hour
+        if t == "morning" and h < 12:
+            out.append(s)
+        if t == "afternoon" and h >= 12:
+            out.append(s)
+    return out
+
+
+def _strategy_order(slots: List[Dict[str, str]], tz: ZoneInfo, strategy: str) -> List[Dict[str, str]]:
+    strat = (strategy or "soonest").strip().lower()
+    ordered = sorted(slots, key=lambda x: x["startUtc"])
+    if strat != "spread":
+        return ordered
+
+    # Spread: pick across days (simple but effective)
+    buckets: Dict[str, List[Dict[str, str]]] = {}
+    for s in ordered:
+        d = _slot_start_local(s, tz).date().isoformat()
+        buckets.setdefault(d, []).append(s)
+
+    days = sorted(buckets.keys())
+    out: List[Dict[str, str]] = []
+    idx = 0
+    while True:
+        progressed = False
+        for d in days:
+            arr = buckets[d]
+            if idx < len(arr):
+                out.append(arr[idx])
+                progressed = True
+        if not progressed:
+            break
+        idx += 1
+    return out
+
+
+def apply_preference_with_fallback(
+    available: List[Dict[str, str]],
+    tz_name: str,
+    pref: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not available:
+        return {"suggestions": [], "usedFallback": False, "reason": "no_available_slots"}
+
+    tz = ZoneInfo(tz_name)
+
+    if not isinstance(pref, dict):
+        base = sorted(available, key=lambda x: x["startUtc"])
+        return {"suggestions": base[:3], "usedFallback": False, "reason": "no_preference"}
+
+    max_results = pref.get("maxResults", 3)
+    try:
+        max_results = int(max_results)
+    except Exception:
+        max_results = 3
+    if max_results <= 0:
+        max_results = 3
+
+    strategy = pref.get("strategy", "soonest")
+    time_of_day = (pref.get("timeOfDay") or "").strip().lower()  # "morning"|"afternoon"|""(none)
+    fallback_tod = pref.get("fallbackTimeOfDay")
+    fallback_tod = True if fallback_tod is None else bool(fallback_tod)
+
+    filtered = available
+
+    # STRICT weekday restriction
+    strict_weekday = False
+    if (pref.get("type") or "").strip().lower() == "weekday":
+        wanted = _weekday_name_to_int(pref.get("weekday") or "")
+        if wanted is not None:
+            strict_weekday = True
+            filtered = [s for s in filtered if _slot_weekday(s, tz) == wanted]
+
+    if strict_weekday and not filtered:
+        return {"suggestions": [], "usedFallback": False, "reason": "no_slots_on_requested_weekday"}
+
+    filtered = _strategy_order(filtered, tz, strategy)
+
+    # Primary time-of-day filter
+    primary = _filter_time_of_day(filtered, tz, time_of_day) if time_of_day else filtered
+    primary = _strategy_order(primary, tz, strategy)
+    suggestions = primary[:max_results]
+
+    used_fallback = False
+
+    # Fallback ONLY switches time-of-day (still respects weekday if it was requested)
+    if fallback_tod and time_of_day in ("morning", "afternoon") and len(suggestions) < max_results:
+        other = "afternoon" if time_of_day == "morning" else "morning"
+        fb = _filter_time_of_day(filtered, tz, other)
+        fb = _strategy_order(fb, tz, strategy)
+
+        seen = {s["startUtc"] + "|" + s["endUtc"] for s in suggestions}
+        for s in fb:
+            k = s["startUtc"] + "|" + s["endUtc"]
+            if k in seen:
+                continue
+            suggestions.append(s)
+            seen.add(k)
+            used_fallback = True
+            if len(suggestions) >= max_results:
+                break
+
+    return {"suggestions": suggestions, "usedFallback": used_fallback, "reason": "ok"}
 
 
 # -------------------------
@@ -385,34 +520,6 @@ def ensure_customer_settings(customer_id: str) -> Dict[str, Any]:
         return {"timezone": "America/Denver", "work_start_hour": 9, "work_end_hour": 17, "work_days": [0, 1, 2, 3, 4]}
 
 
-def update_customer_settings(customer_id: str, tz_name: str, work_start: int, work_end: int, work_days: List[int]) -> Dict[str, Any]:
-    # Validate tz
-    try:
-        ZoneInfo(tz_name)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid timeZone")
-    if not (0 <= work_start <= 23 and 0 <= work_end <= 24 and work_end > work_start):
-        raise HTTPException(status_code=400, detail="Invalid working hours")
-    if not work_days:
-        raise HTTPException(status_code=400, detail="workDays cannot be empty")
-
-    with engine.begin() as conn:
-        conn.execute(
-            text("""
-                INSERT INTO customer_settings(customer_id, timezone, work_start_hour, work_end_hour, work_days)
-                VALUES (:cid, :tz, :ws, :we, :wd)
-                ON CONFLICT (customer_id) DO UPDATE SET
-                  timezone = EXCLUDED.timezone,
-                  work_start_hour = EXCLUDED.work_start_hour,
-                  work_end_hour = EXCLUDED.work_end_hour,
-                  work_days = EXCLUDED.work_days
-            """),
-            {"cid": customer_id, "tz": tz_name, "ws": work_start, "we": work_end, "wd": json.dumps(work_days)},
-        )
-
-    return ensure_customer_settings(customer_id)
-
-
 def upsert_calendars(customer_id: str, calendars: List[Dict[str, Any]]) -> None:
     q = text("""
         INSERT INTO customer_calendars(provider, customer_id, calendar_id, summary, primary_cal, selected)
@@ -428,16 +535,13 @@ def upsert_calendars(customer_id: str, calendars: List[Dict[str, Any]]) -> None:
                 continue
             primary = bool(c.get("primary", False))
             selected = True if primary else False
-            conn.execute(
-                q,
-                {
-                    "cid": customer_id,
-                    "calid": calid,
-                    "summary": c.get("summary"),
-                    "primary": primary,
-                    "selected": selected,
-                },
-            )
+            conn.execute(q, {
+                "cid": customer_id,
+                "calid": calid,
+                "summary": c.get("summary"),
+                "primary": primary,
+                "selected": selected,
+            })
 
         count_sel = conn.execute(
             text("SELECT COUNT(*) FROM customer_calendars WHERE provider='google' AND customer_id=:cid AND selected=true"),
@@ -471,6 +575,7 @@ def list_calendars_db(customer_id: str) -> List[Dict[str, Any]]:
 def set_selected_calendars(customer_id: str, calendar_ids: List[str]) -> None:
     if not calendar_ids:
         raise HTTPException(status_code=400, detail="calendarIds must not be empty")
+
     with engine.begin() as conn:
         conn.execute(
             text("UPDATE customer_calendars SET selected=false WHERE provider='google' AND customer_id=:cid"),
@@ -515,13 +620,7 @@ def google_calendar_list(access_token: str) -> Dict[str, Any]:
     return {"statusCode": r.status_code, "json": safe_json(r), "text": r.text}
 
 
-def freebusy_raw(
-    access_token: str,
-    calendar_ids: List[str],
-    time_min_utc: datetime,
-    time_max_utc: datetime,
-    time_zone: str,
-) -> Dict[str, Any]:
+def freebusy_raw(access_token: str, calendar_ids: List[str], time_min_utc: datetime, time_max_utc: datetime, time_zone: str) -> Dict[str, Any]:
     body = {
         "timeMin": iso_z(time_min_utc),
         "timeMax": iso_z(time_max_utc),
@@ -537,15 +636,7 @@ def freebusy_raw(
     return {"statusCode": r.status_code, "json": safe_json(r), "text": r.text, "requestBody": body}
 
 
-def google_create_event_api(
-    access_token: str,
-    calendar_id: str,
-    summary: str,
-    description: str,
-    start_utc: datetime,
-    end_utc: datetime,
-    tz_name: str,
-) -> Dict[str, Any]:
+def google_create_event_api(access_token: str, calendar_id: str, summary: str, description: str, start_utc: datetime, end_utc: datetime, tz_name: str) -> Dict[str, Any]:
     tz = ZoneInfo(tz_name)
     body = {
         "summary": summary,
@@ -554,28 +645,14 @@ def google_create_event_api(
         "end": {"dateTime": end_utc.astimezone(tz).isoformat(), "timeZone": tz_name},
     }
     url = GOOGLE_EVENTS_URL.format(calendarId=safe_cal_id(calendar_id))
-    r = requests.post(
-        url,
-        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-        data=json.dumps(body),
-        timeout=30,
-    )
+    r = requests.post(url, headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, data=json.dumps(body), timeout=30)
     return {"statusCode": r.status_code, "json": safe_json(r), "text": r.text, "requestBody": body}
 
 
 # -------------------------
-# Busy collection (FreeBusy + Events fallback)
+# Busy collection
 # -------------------------
-def collect_busy_utc(
-    access_token: str,
-    tz_name: str,
-    calendar_ids: List[str],
-    time_min_utc: datetime,
-    time_max_utc: datetime,
-) -> Dict[str, Any]:
-    """
-    Returns merged busy in UTC.
-    """
+def collect_busy_utc(access_token: str, tz_name: str, calendar_ids: List[str], time_min_utc: datetime, time_max_utc: datetime) -> Dict[str, Any]:
     fb = freebusy_raw(access_token, calendar_ids, time_min_utc, time_max_utc, tz_name)
 
     busy_intervals: List[Tuple[datetime, datetime]] = []
@@ -596,7 +673,7 @@ def collect_busy_utc(
                 except Exception:
                     continue
 
-    # Events fallback: helpful when FreeBusy misses things (rare but can happen)
+    # Events fallback: skip transparent events
     for cid in calendar_ids:
         url = GOOGLE_EVENTS_URL.format(calendarId=safe_cal_id(cid))
         params = {
@@ -609,10 +686,14 @@ def collect_busy_utc(
         r = requests.get(url, headers={"Authorization": f"Bearer {access_token}"}, params=params, timeout=30)
         if r.status_code != 200:
             continue
+
         items = (r.json() or {}).get("items", []) or []
         for ev in items:
             if ev.get("status") == "cancelled":
                 continue
+            if (ev.get("transparency") or "").lower() == "transparent":
+                continue
+
             start = (ev.get("start") or {}).get("dateTime")
             end = (ev.get("end") or {}).get("dateTime")
             if not start or not end:
@@ -640,7 +721,7 @@ def collect_busy_utc(
 
 
 # -------------------------
-# Availability engine (overlap-safe)
+# Availability engine
 # -------------------------
 def compute_availability(
     access_token: str,
@@ -657,7 +738,6 @@ def compute_availability(
     tz = ZoneInfo(tz_name)
     now_local = datetime.now(tz).replace(second=0, microsecond=0)
 
-    # IMPORTANT: horizon end must include the *end of the last day window*, not "now + N days at current time"
     start_day = now_local.date()
     end_day = start_day + timedelta(days=max(1, int(days)))
     horizon_end_local = datetime(end_day.year, end_day.month, end_day.day, work_end_hour, 0, tzinfo=tz)
@@ -665,7 +745,6 @@ def compute_availability(
     time_min_utc = now_local.astimezone(timezone.utc)
     time_max_utc = horizon_end_local.astimezone(timezone.utc)
 
-    # Collect merged busy across calendars for the horizon
     busy_pack = collect_busy_utc(access_token, tz_name, calendar_ids, time_min_utc, time_max_utc)
     if not busy_pack.get("ok"):
         return {"ok": False, "reason": "busy_collect_failed"}
@@ -690,7 +769,6 @@ def compute_availability(
         win_start_local = datetime(d.year, d.month, d.day, work_start_hour, 0, tzinfo=tz)
         win_end_local = datetime(d.year, d.month, d.day, work_end_hour, 0, tzinfo=tz)
 
-        # today: don't offer times in the past
         if d == now_local.date() and now_local > win_start_local:
             win_start_local = now_local
 
@@ -709,14 +787,12 @@ def compute_availability(
 
             free, busy_ptr = slot_is_free(slot_start, slot_end, merged_busy, busy_ptr)
             if free:
-                available.append(
-                    {
-                        "startUtc": iso_z(slot_start),
-                        "endUtc": iso_z(slot_end),
-                        "startLocal": format_local(slot_start, tz),
-                        "endLocal": format_local(slot_end, tz),
-                    }
-                )
+                available.append({
+                    "startUtc": iso_z(slot_start),
+                    "endUtc": iso_z(slot_end),
+                    "startLocal": format_local(slot_start, tz),
+                    "endLocal": format_local(slot_end, tz),
+                })
 
             t = t + step
 
@@ -730,8 +806,8 @@ def compute_availability(
         "busyMergedCount": len(merged_busy),
         "availableCount": len(available),
         "suggestions": suggestions,
-        # keep response manageable
         "available": available[:500],
+        "_availableAll": available,
     }
 
 
@@ -749,35 +825,6 @@ def debug_db(request: Request):
     with engine.begin() as conn:
         v = conn.execute(text("SELECT 1")).scalar_one()
     return {"db_ok": True, "select_1": v}
-
-
-@app.get("/debug/schema")
-def debug_schema(request: Request):
-    require_debug_key(request)
-    out: Dict[str, Any] = {"tables": []}
-    with engine.begin() as conn:
-        tables = conn.execute(
-            text("""
-                SELECT table_name
-                FROM information_schema.tables
-                WHERE table_schema='public'
-                ORDER BY table_name
-            """)
-        ).fetchall()
-        out["tables"] = [t[0] for t in tables]
-
-        for tname in out["tables"]:
-            cols = conn.execute(
-                text("""
-                    SELECT column_name AS name, data_type AS type
-                    FROM information_schema.columns
-                    WHERE table_schema='public' AND table_name=:t
-                    ORDER BY ordinal_position
-                """),
-                {"t": tname},
-            ).fetchall()
-            out[tname] = [{"name": c[0], "type": c[1]} for c in cols]
-    return out
 
 
 @app.get("/oauth/google/start")
@@ -851,47 +898,8 @@ async def google_select_calendars(payload: Dict[str, Any]):
     return {"ok": True, "customerId": customer_id, "selected": selected_calendar_ids(customer_id)}
 
 
-@app.post("/google/settings")
-async def google_settings(payload: Dict[str, Any]):
-    """
-    Set per-customer defaults.
-    Body:
-    {
-      "customerId": "pm_1",
-      "timeZone": "America/Denver",
-      "workStartHour": 9,
-      "workEndHour": 17,
-      "workDays": [0,1,2,3,4]
-    }
-    """
-    customer_id = payload.get("customerId")
-    if not customer_id:
-        raise HTTPException(status_code=400, detail="customerId required")
-
-    settings = ensure_customer_settings(customer_id)
-
-    tz_name = payload.get("timeZone") or settings["timezone"]
-    ws = int(payload.get("workStartHour", settings["work_start_hour"]))
-    we = int(payload.get("workEndHour", settings["work_end_hour"]))
-    wd = normalize_work_days(payload.get("workDays", settings["work_days"]))
-
-    updated = update_customer_settings(customer_id, tz_name, ws, we, wd)
-    return {"ok": True, "customerId": customer_id, "settings": updated}
-
-
 @app.post("/google/freebusy")
 async def google_freebusy(payload: Dict[str, Any]):
-    """
-    Returns merged busy across selected calendars (or calendarIds if provided).
-    Body:
-    {
-      "customerId": "pm_1",
-      "timeMinUtc": "2026-03-02T00:00:00Z",
-      "timeMaxUtc": "2026-03-10T00:00:00Z",
-      "timeZone": "America/Denver",
-      "calendarIds": ["primary", "..."]  # optional
-    }
-    """
     customer_id = payload.get("customerId")
     if not customer_id:
         raise HTTPException(status_code=400, detail="customerId required")
@@ -900,10 +908,10 @@ async def google_freebusy(payload: Dict[str, Any]):
     tz_name = payload.get("timeZone") or settings["timezone"]
 
     try:
-        time_min = parse_iso_to_utc(payload.get("timeMinUtc"))
-        time_max = parse_iso_to_utc(payload.get("timeMaxUtc"))
+        time_min = parse_any_datetime_to_utc(payload.get("timeMinUtc"), tz_name)
+        time_max = parse_any_datetime_to_utc(payload.get("timeMaxUtc"), tz_name)
     except Exception:
-        raise HTTPException(status_code=400, detail="timeMinUtc and timeMaxUtc required and must be ISO (Z or offset)")
+        raise HTTPException(status_code=400, detail="timeMinUtc and timeMaxUtc required and must be ISO")
 
     cal_ids = payload.get("calendarIds")
     calendar_ids = cal_ids if isinstance(cal_ids, list) and cal_ids else selected_calendar_ids(customer_id)
@@ -916,22 +924,6 @@ async def google_freebusy(payload: Dict[str, Any]):
 
 @app.post("/google/availability")
 async def google_availability(payload: Dict[str, Any]):
-    """
-    Body:
-    {
-      "customerId": "pm_1",
-      "days": 7,
-      "durationMinutes": 60,
-      "stepMinutes": 30,
-
-      "timeZone": "America/Denver",          # optional
-      "workStartHour": 9,                    # optional
-      "workEndHour": 17,                     # optional
-      "workDays": [0,1,2,3,4],               # optional
-      "calendarIds": ["primary", "..."],     # optional (else uses selected from DB)
-      "preferredDateTimeUtc": "2026-03-03T20:00:00Z"  # optional
-    }
-    """
     customer_id = payload.get("customerId")
     if not customer_id:
         raise HTTPException(status_code=400, detail="customerId required")
@@ -954,14 +946,14 @@ async def google_availability(payload: Dict[str, Any]):
     preferred_utc = None
     if preferred_raw:
         try:
-            preferred_utc = parse_iso_to_utc(preferred_raw)
+            preferred_utc = parse_any_datetime_to_utc(preferred_raw, tz_name)
         except Exception:
-            return {"ok": False, "reason": "invalid_preferredDateTimeUtc", "message": "preferredDateTimeUtc must be ISO with Z or offset"}
+            return {"ok": False, "reason": "invalid_preferredDateTimeUtc", "message": "preferredDateTimeUtc must be ISO"}
 
     rt = load_refresh_token(customer_id)
     access_token = refresh_access_token(rt)
 
-    return compute_availability(
+    result = compute_availability(
         access_token=access_token,
         tz_name=tz_name,
         work_start_hour=work_start,
@@ -974,23 +966,21 @@ async def google_availability(payload: Dict[str, Any]):
         preferred_utc=preferred_utc,
     )
 
+    if result.get("ok"):
+        pref = payload.get("preference")
+        full_list = result.get("_availableAll", result.get("available", []))
+        pref_out = apply_preference_with_fallback(full_list, tz_name, pref)
+
+        result["suggestions"] = pref_out["suggestions"]
+        result["preferenceUsedFallback"] = pref_out["usedFallback"]
+        result["preferenceReason"] = pref_out["reason"]
+
+    result.pop("_availableAll", None)
+    return result
+
 
 @app.post("/google/create_event")
 async def google_create_event(payload: Dict[str, Any]):
-    """
-    Books if free; returns JSON even when slot is taken.
-
-    Body:
-    {
-      "customerId": "pm_1",
-      "calendarId": "primary",   # where to create the event
-      "summary": "...",
-      "description": "...",
-      "timeZone": "America/Denver",   # optional (defaults to customer settings)
-      "start": {"dateTime": "2026-02-02T21:00:00Z"},
-      "end":   {"dateTime": "2026-02-02T22:00:00Z"}
-    }
-    """
     customer_id = payload.get("customerId")
     if not customer_id:
         raise HTTPException(status_code=400, detail="customerId required")
@@ -1014,7 +1004,7 @@ async def google_create_event(payload: Dict[str, Any]):
         return {
             "booked": False,
             "reason": "invalid_datetime",
-            "message": "start.dateTime and end.dateTime must be valid ISO datetimes (Z/offset) or naive ISO assumed in timeZone",
+            "message": "start.dateTime and end.dateTime must be valid ISO (Z/offset) or naive ISO assumed in timeZone",
             "error": repr(e),
         }
 
@@ -1024,13 +1014,11 @@ async def google_create_event(payload: Dict[str, Any]):
     rt = load_refresh_token(customer_id)
     access_token = refresh_access_token(rt)
 
-    # Check slot across ALL selected calendars (prevents double booking)
+    # Check across all selected calendars
     calendars_to_check = selected_calendar_ids(customer_id)
-    # Always include the target calendarId too
     if calendar_id not in calendars_to_check:
         calendars_to_check = [calendar_id] + calendars_to_check
 
-    # Small buffer to ensure we capture touching events precisely
     time_min = start_utc - timedelta(minutes=1)
     time_max = end_utc + timedelta(minutes=1)
 
@@ -1040,7 +1028,6 @@ async def google_create_event(payload: Dict[str, Any]):
         merged_busy.append((parse_iso_to_utc(it["startUtc"]), parse_iso_to_utc(it["endUtc"])))
     merged_busy = merge_intervals_dt(merged_busy)
 
-    # overlap check (true overlap; touching edges are allowed)
     for bs, be in merged_busy:
         if overlaps(start_utc, end_utc, bs, be):
             return {
@@ -1052,7 +1039,6 @@ async def google_create_event(payload: Dict[str, Any]):
                 "busyMerged": [{"startUtc": iso_z(bs), "endUtc": iso_z(be)} for bs, be in merged_busy],
             }
 
-    # Create event
     created = google_create_event_api(access_token, calendar_id, summary, description, start_utc, end_utc, tz_name)
     if created["statusCode"] not in (200, 201):
         return {
