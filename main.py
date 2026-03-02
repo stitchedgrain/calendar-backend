@@ -86,66 +86,30 @@ app = FastAPI(title="Calendar Backend", version="1.0.0")
 # DB
 # -------------------------
 def make_engine() -> Engine:
-    # DATABASE_URL should be like: postgresql+psycopg://user:pass@host:5432/db
-    return create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+    raw = (os.environ.get("DATABASE_URL") or "").strip()
 
+    if not raw:
+        raise RuntimeError("DATABASE_URL env var is missing/empty in Render")
 
-engine = make_engine()
+    # remove accidental wrapping quotes
+    if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+        raw = raw[1:-1].strip()
 
+    # Render sometimes provides postgres:// — normalize
+    if raw.startswith("postgres://"):
+        raw = raw.replace("postgres://", "postgresql+psycopg://", 1)
+    elif raw.startswith("postgresql://"):
+        # force psycopg v3 driver
+        raw = raw.replace("postgresql://", "postgresql+psycopg://", 1)
+    elif raw.startswith("postgresql+psycopg2://"):
+        raw = raw.replace("postgresql+psycopg2://", "postgresql+psycopg://", 1)
 
-def init_db() -> None:
-    ddl = """
-    CREATE TABLE IF NOT EXISTS oauth_states (
-      state       TEXT PRIMARY KEY,
-      customer_id TEXT NOT NULL,
-      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
+    # basic sanity check so the error is clearer
+    if "://" not in raw or raw.count("://") != 1:
+        # don’t print the whole URL (it has passwords). just show prefix.
+        raise RuntimeError(f"DATABASE_URL looks malformed (prefix={raw[:20]!r}). Expected postgresql+psycopg://...")
 
-    CREATE TABLE IF NOT EXISTS oauth_tokens (
-      provider      TEXT NOT NULL,
-      customer_id   TEXT NOT NULL,
-      user_email    TEXT NOT NULL,
-      refresh_token TEXT NOT NULL,
-      scope         TEXT,
-      token_type    TEXT,
-      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (provider, customer_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS customer_calendars (
-      provider    TEXT NOT NULL,
-      customer_id TEXT NOT NULL,
-      calendar_id TEXT NOT NULL,
-      summary     TEXT,
-      primary_cal BOOLEAN NOT NULL DEFAULT FALSE,
-      selected    BOOLEAN NOT NULL DEFAULT FALSE,
-      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (provider, customer_id, calendar_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS customer_settings (
-      customer_id     TEXT PRIMARY KEY,
-      timezone        TEXT NOT NULL DEFAULT 'America/Denver',
-      work_start_hour INT  NOT NULL DEFAULT 9,
-      work_end_hour   INT  NOT NULL DEFAULT 17,
-      work_days       TEXT NOT NULL DEFAULT '[0,1,2,3,4]',
-      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-    """
-    with engine.begin() as conn:
-        conn.execute(text(ddl))
-
-
-init_db()
-
-
-def require_debug_key(request: Request) -> None:
-    if not DEBUG_API_KEY:
-        return
-    key = request.headers.get("x-debug-key") or request.query_params.get("key")
-    if key != DEBUG_API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
+    return create_engine(raw, pool_pre_ping=True, future=True)
 
 # -------------------------
 # Time / parsing helpers
