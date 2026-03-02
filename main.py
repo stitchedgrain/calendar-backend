@@ -141,3 +141,8 @@ def compute_availability(
         "suggestions": suggestions,
         "available": available[:500],
     }
+def slot_overlaps_busy(slot_start: datetime, slot_end: datetime, busy: List[Dict[str, datetime]]) -> bool:
+    for b in busy:
+        if slot_start < b["end"] and slot_end > b["start"]:
+            return True
+    return False
