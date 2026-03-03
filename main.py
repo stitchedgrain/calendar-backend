@@ -1011,3 +1011,173 @@ async def google_cancel_events(request: Request, payload: Dict[str, Any]):
             results.append({"calendarId": calendar_id, "eventId": event_id, "cancelled": True})
 
     return {"ok": True, "customerId": customer_id, "count": len(results), "results": results}
+def google_patch_event_api(
+    access_token: str,
+    calendar_id: str,
+    event_id: str,
+    start_utc: datetime,
+    end_utc: datetime,
+    tz_name: str,
+) -> Dict[str, Any]:
+    tz = ZoneInfo(tz_name)
+    body = {
+        "start": {"dateTime": start_utc.astimezone(tz).isoformat(), "timeZone": tz_name},
+        "end":   {"dateTime": end_utc.astimezone(tz).isoformat(), "timeZone": tz_name},
+    }
+    url = GOOGLE_EVENTS_URL.format(calendarId=safe_cal_id(calendar_id)) + f"/{safe_cal_id(event_id)}"
+    r = requests.patch(
+        url,
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+        data=json.dumps(body),
+        timeout=30,
+    )
+    return {"statusCode": r.status_code, "json": safe_json(r), "text": r.text, "requestBody": body}
+
+
+@app.post("/google/reschedule_event")
+async def google_reschedule_event(payload: Dict[str, Any]):
+    """
+    Reschedule ONE event.
+    Body:
+    {
+      "customerId":"pm_1",
+      "calendarId":"primary",
+      "eventId":"....",
+      "timeZone":"America/Denver",
+      "start":{"dateTime":"2026-03-05T20:00:00Z"},
+      "end":{"dateTime":"2026-03-05T21:00:00Z"}
+    }
+    """
+    customer_id = (payload.get("customerId") or "").strip()
+    calendar_id = (payload.get("calendarId") or "").strip()
+    event_id = (payload.get("eventId") or "").strip()
+
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="customerId required")
+    if not calendar_id:
+        raise HTTPException(status_code=400, detail="calendarId required")
+    if not event_id:
+        raise HTTPException(status_code=400, detail="eventId required")
+
+    settings = ensure_customer_settings(customer_id)
+    tz_name = payload.get("timeZone") or settings["timezone"]
+
+    start_obj = payload.get("start") or {}
+    end_obj = payload.get("end") or {}
+    raw_start = (start_obj.get("dateTime") or "").strip()
+    raw_end = (end_obj.get("dateTime") or "").strip()
+
+    try:
+        start_utc = parse_any_datetime_to_utc(raw_start, tz_name)
+        end_utc = parse_any_datetime_to_utc(raw_end, tz_name)
+    except Exception as e:
+        return {"ok": False, "rescheduled": False, "reason": "invalid_datetime", "error": repr(e)}
+
+    if end_utc <= start_utc:
+        return {"ok": False, "rescheduled": False, "reason": "invalid_range", "message": "end must be after start"}
+
+    rt = load_refresh_token(customer_id)
+    access_token = refresh_access_token(rt)
+
+    # Check conflicts across selected calendars + the target calendar
+    calendars_to_check = selected_calendar_ids(customer_id)
+    if calendar_id not in calendars_to_check:
+        calendars_to_check = [calendar_id] + calendars_to_check
+
+    time_min = start_utc - timedelta(minutes=1)
+    time_max = end_utc + timedelta(minutes=1)
+
+    busy_pack = collect_busy_utc(access_token, tz_name, calendars_to_check, time_min, time_max)
+    merged_busy: List[Tuple[datetime, datetime]] = []
+    for it in busy_pack["busyMerged"]:
+        merged_busy.append((parse_iso_to_utc(it["startUtc"]), parse_iso_to_utc(it["endUtc"])))
+    merged_busy = merge_intervals_dt(merged_busy)
+
+    for bs, be in merged_busy:
+        if overlaps(start_utc, end_utc, bs, be):
+            return {
+                "ok": True,
+                "rescheduled": False,
+                "reason": "slot_taken",
+                "message": "That time is already booked. Please pick another slot.",
+                "checkedCalendars": calendars_to_check,
+                "busyMerged": [{"startUtc": iso_z(bs), "endUtc": iso_z(be)} for bs, be in merged_busy],
+            }
+
+    patched = google_patch_event_api(access_token, calendar_id, event_id, start_utc, end_utc, tz_name)
+    if patched["statusCode"] not in (200,):
+        return {
+            "ok": False,
+            "rescheduled": False,
+            "reason": "google_patch_failed",
+            "statusCode": patched["statusCode"],
+            "googleResponseText": patched["text"],
+            "requestBody": patched["requestBody"],
+        }
+
+    return {
+        "ok": True,
+        "rescheduled": True,
+        "calendarId": calendar_id,
+        "eventId": event_id,
+        "startUtc": iso_z(start_utc),
+        "endUtc": iso_z(end_utc),
+        "event": patched.get("json"),
+    }
+
+
+@app.post("/google/reschedule_events")
+async def google_reschedule_events(payload: Dict[str, Any]):
+    """
+    Reschedule MULTIPLE events.
+    Body:
+    {
+      "customerId":"pm_1",
+      "timeZone":"America/Denver",
+      "items":[{...},{...}]
+    }
+    """
+    customer_id = (payload.get("customerId") or "").strip()
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="customerId required")
+
+    settings = ensure_customer_settings(customer_id)
+    tz_name = payload.get("timeZone") or settings["timezone"]
+
+    items = payload.get("items") or []
+    if not isinstance(items, list) or not items:
+        raise HTTPException(status_code=400, detail="items must be a non-empty list")
+
+    # Filter out blank rows safely
+    clean_items = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        cal_id = (it.get("calendarId") or "").strip()
+        ev_id = (it.get("eventId") or "").strip()
+        s = ((it.get("start") or {}).get("dateTime") or "").strip()
+        e = ((it.get("end") or {}).get("dateTime") or "").strip()
+        if cal_id and ev_id and s and e:
+            clean_items.append(it)
+
+    if not clean_items:
+        raise HTTPException(status_code=400, detail="No valid items found (calendarId/eventId/start/end required)")
+
+    rt = load_refresh_token(customer_id)
+    access_token = refresh_access_token(rt)
+
+    results = []
+    for it in clean_items:
+        # Reuse the single endpoint logic by calling it directly
+        single_payload = {
+            "customerId": customer_id,
+            "calendarId": it["calendarId"],
+            "eventId": it["eventId"],
+            "timeZone": tz_name,
+            "start": it["start"],
+            "end": it["end"],
+        }
+        res = await google_reschedule_event(single_payload)
+        results.append(res)
+
+    return {"ok": True, "count": len(results), "results": results}
