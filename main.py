@@ -92,6 +92,7 @@ MS_SCOPES = [
     "openid",
     "profile",
     "email",
+    "https://graph.microsoft.com/User.Read",
     "https://graph.microsoft.com/Calendars.ReadWrite",
 ]
 
