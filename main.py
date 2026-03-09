@@ -18,7 +18,7 @@ from sqlalchemy.engine import Engine
 # =============================================================================
 # App
 # =============================================================================
-app = FastAPI(title="Calendar Backend", version="3.1.0")
+app = FastAPI(title="Calendar Backend", version="3.2.0")
 
 # =============================================================================
 # Env
@@ -87,6 +87,148 @@ MS_SCOPES = [
     "https://graph.microsoft.com/Calendars.ReadWrite",
 ]
 
+# Microsoft / Windows timezone names often returned by Graph
+WINDOWS_TZ_TO_IANA: Dict[str, str] = {
+    "UTC": "UTC",
+    "Dateline Standard Time": "Etc/GMT+12",
+    "UTC-11": "Etc/GMT+11",
+    "Aleutian Standard Time": "America/Adak",
+    "Hawaiian Standard Time": "Pacific/Honolulu",
+    "Marquesas Standard Time": "Pacific/Marquesas",
+    "Alaskan Standard Time": "America/Anchorage",
+    "UTC-09": "Etc/GMT+9",
+    "Pacific Standard Time (Mexico)": "America/Tijuana",
+    "UTC-08": "Etc/GMT+8",
+    "Pacific Standard Time": "America/Los_Angeles",
+    "US Mountain Standard Time": "America/Phoenix",
+    "Mountain Standard Time (Mexico)": "America/Chihuahua",
+    "Mountain Standard Time": "America/Denver",
+    "Central America Standard Time": "America/Guatemala",
+    "Central Standard Time": "America/Chicago",
+    "Easter Island Standard Time": "Pacific/Easter",
+    "Central Standard Time (Mexico)": "America/Mexico_City",
+    "Canada Central Standard Time": "America/Regina",
+    "SA Pacific Standard Time": "America/Bogota",
+    "Eastern Standard Time (Mexico)": "America/Cancun",
+    "Eastern Standard Time": "America/New_York",
+    "Haiti Standard Time": "America/Port-au-Prince",
+    "Cuba Standard Time": "America/Havana",
+    "US Eastern Standard Time": "America/Indianapolis",
+    "Turks And Caicos Standard Time": "America/Grand_Turk",
+    "Paraguay Standard Time": "America/Asuncion",
+    "Atlantic Standard Time": "America/Halifax",
+    "Venezuela Standard Time": "America/Caracas",
+    "Central Brazilian Standard Time": "America/Cuiaba",
+    "SA Western Standard Time": "America/La_Paz",
+    "Pacific SA Standard Time": "America/Santiago",
+    "Newfoundland Standard Time": "America/St_Johns",
+    "Tocantins Standard Time": "America/Araguaina",
+    "E. South America Standard Time": "America/Sao_Paulo",
+    "SA Eastern Standard Time": "America/Cayenne",
+    "Argentina Standard Time": "America/Buenos_Aires",
+    "Greenland Standard Time": "America/Godthab",
+    "Montevideo Standard Time": "America/Montevideo",
+    "Magallanes Standard Time": "America/Punta_Arenas",
+    "Saint Pierre Standard Time": "America/Miquelon",
+    "Bahia Standard Time": "America/Bahia",
+    "UTC-02": "Etc/GMT+2",
+    "Mid-Atlantic Standard Time": "Etc/GMT+2",
+    "Azores Standard Time": "Atlantic/Azores",
+    "Cape Verde Standard Time": "Atlantic/Cape_Verde",
+    "UTC": "UTC",
+    "Morocco Standard Time": "Africa/Casablanca",
+    "GMT Standard Time": "Europe/London",
+    "Greenwich Standard Time": "Atlantic/Reykjavik",
+    "W. Europe Standard Time": "Europe/Berlin",
+    "Central Europe Standard Time": "Europe/Budapest",
+    "Romance Standard Time": "Europe/Paris",
+    "Central European Standard Time": "Europe/Warsaw",
+    "W. Central Africa Standard Time": "Africa/Lagos",
+    "Jordan Standard Time": "Asia/Amman",
+    "GTB Standard Time": "Europe/Bucharest",
+    "Middle East Standard Time": "Asia/Beirut",
+    "Egypt Standard Time": "Africa/Cairo",
+    "E. Europe Standard Time": "Europe/Chisinau",
+    "Syria Standard Time": "Asia/Damascus",
+    "West Bank Standard Time": "Asia/Hebron",
+    "South Africa Standard Time": "Africa/Johannesburg",
+    "FLE Standard Time": "Europe/Kyiv",
+    "Israel Standard Time": "Asia/Jerusalem",
+    "Kaliningrad Standard Time": "Europe/Kaliningrad",
+    "Sudan Standard Time": "Africa/Khartoum",
+    "Libya Standard Time": "Africa/Tripoli",
+    "Namibia Standard Time": "Africa/Windhoek",
+    "Arabic Standard Time": "Asia/Baghdad",
+    "Turkey Standard Time": "Europe/Istanbul",
+    "Arab Standard Time": "Asia/Riyadh",
+    "Belarus Standard Time": "Europe/Minsk",
+    "Russian Standard Time": "Europe/Moscow",
+    "E. Africa Standard Time": "Africa/Nairobi",
+    "Iran Standard Time": "Asia/Tehran",
+    "Arabian Standard Time": "Asia/Dubai",
+    "Astrakhan Standard Time": "Europe/Astrakhan",
+    "Azerbaijan Standard Time": "Asia/Baku",
+    "Russia Time Zone 3": "Europe/Samara",
+    "Mauritius Standard Time": "Indian/Mauritius",
+    "Saratov Standard Time": "Europe/Saratov",
+    "Georgian Standard Time": "Asia/Tbilisi",
+    "Volgograd Standard Time": "Europe/Volgograd",
+    "Caucasus Standard Time": "Asia/Yerevan",
+    "Afghanistan Standard Time": "Asia/Kabul",
+    "West Asia Standard Time": "Asia/Tashkent",
+    "Ekaterinburg Standard Time": "Asia/Yekaterinburg",
+    "Pakistan Standard Time": "Asia/Karachi",
+    "Qyzylorda Standard Time": "Asia/Qyzylorda",
+    "India Standard Time": "Asia/Kolkata",
+    "Sri Lanka Standard Time": "Asia/Colombo",
+    "Nepal Standard Time": "Asia/Kathmandu",
+    "Central Asia Standard Time": "Asia/Almaty",
+    "Bangladesh Standard Time": "Asia/Dhaka",
+    "Omsk Standard Time": "Asia/Omsk",
+    "Myanmar Standard Time": "Asia/Yangon",
+    "SE Asia Standard Time": "Asia/Bangkok",
+    "Altai Standard Time": "Asia/Barnaul",
+    "W. Mongolia Standard Time": "Asia/Hovd",
+    "North Asia Standard Time": "Asia/Krasnoyarsk",
+    "N. Central Asia Standard Time": "Asia/Novosibirsk",
+    "Tomsk Standard Time": "Asia/Tomsk",
+    "China Standard Time": "Asia/Shanghai",
+    "North Asia East Standard Time": "Asia/Irkutsk",
+    "Singapore Standard Time": "Asia/Singapore",
+    "W. Australia Standard Time": "Australia/Perth",
+    "Taipei Standard Time": "Asia/Taipei",
+    "Ulaanbaatar Standard Time": "Asia/Ulaanbaatar",
+    "Aus Central W. Standard Time": "Australia/Eucla",
+    "Transbaikal Standard Time": "Asia/Chita",
+    "Tokyo Standard Time": "Asia/Tokyo",
+    "North Korea Standard Time": "Asia/Pyongyang",
+    "Korea Standard Time": "Asia/Seoul",
+    "Yakutsk Standard Time": "Asia/Yakutsk",
+    "Cen. Australia Standard Time": "Australia/Adelaide",
+    "AUS Central Standard Time": "Australia/Darwin",
+    "E. Australia Standard Time": "Australia/Brisbane",
+    "AUS Eastern Standard Time": "Australia/Sydney",
+    "West Pacific Standard Time": "Pacific/Port_Moresby",
+    "Tasmania Standard Time": "Australia/Hobart",
+    "Vladivostok Standard Time": "Asia/Vladivostok",
+    "Lord Howe Standard Time": "Australia/Lord_Howe",
+    "Bougainville Standard Time": "Pacific/Bougainville",
+    "Russia Time Zone 10": "Asia/Srednekolymsk",
+    "Magadan Standard Time": "Asia/Magadan",
+    "Norfolk Standard Time": "Pacific/Norfolk",
+    "Sakhalin Standard Time": "Asia/Sakhalin",
+    "Central Pacific Standard Time": "Pacific/Guadalcanal",
+    "Russia Time Zone 11": "Asia/Kamchatka",
+    "New Zealand Standard Time": "Pacific/Auckland",
+    "UTC+12": "Etc/GMT-12",
+    "Fiji Standard Time": "Pacific/Fiji",
+    "Chatham Islands Standard Time": "Pacific/Chatham",
+    "UTC+13": "Etc/GMT-13",
+    "Tonga Standard Time": "Pacific/Tongatapu",
+    "Samoa Standard Time": "Pacific/Apia",
+    "Line Islands Standard Time": "Pacific/Kiritimati",
+}
+
 # =============================================================================
 # API key helpers
 # =============================================================================
@@ -104,6 +246,24 @@ def require_debug_key(request: Request) -> None:
     key = request.headers.get("x-debug-key") or request.headers.get("X-Debug-Key")
     if key != DEBUG_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+# =============================================================================
+# Timezone helpers
+# =============================================================================
+def normalize_tz_name_for_zoneinfo(tz_name: str) -> str:
+    raw = (tz_name or "UTC").strip() or "UTC"
+    if raw in WINDOWS_TZ_TO_IANA:
+        return WINDOWS_TZ_TO_IANA[raw]
+    return raw
+
+
+def zoneinfo_from_any_tz(tz_name: str) -> ZoneInfo:
+    norm = normalize_tz_name_for_zoneinfo(tz_name)
+    try:
+        return ZoneInfo(norm)
+    except Exception:
+        return ZoneInfo("UTC")
 
 
 # =============================================================================
@@ -229,10 +389,12 @@ def parse_any_datetime_to_utc(raw: str, tz_name: str) -> datetime:
     s = (raw or "").strip()
     if not s:
         raise ValueError("Empty datetime")
+
     if s.endswith("Z") or ("+" in s[10:] or "-" in s[10:]):
         return parse_iso_to_utc(s)
+
     dt = datetime.fromisoformat(s)
-    tz = ZoneInfo(tz_name)
+    tz = zoneinfo_from_any_tz(tz_name)
     return dt.replace(tzinfo=tz).astimezone(timezone.utc)
 
 
@@ -507,7 +669,7 @@ def update_customer_settings(
     work_days: List[int],
 ) -> Dict[str, Any]:
     try:
-        ZoneInfo(tz_name)
+        zoneinfo_from_any_tz(tz_name)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid timeZone")
 
@@ -767,12 +929,12 @@ def google_create_event_api(
     tz_name: str,
     attendees: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
-    tz = ZoneInfo(tz_name)
+    tz = zoneinfo_from_any_tz(tz_name)
     body: Dict[str, Any] = {
         "summary": summary,
         "description": description,
-        "start": {"dateTime": start_utc.astimezone(tz).isoformat(), "timeZone": tz_name},
-        "end": {"dateTime": end_utc.astimezone(tz).isoformat(), "timeZone": tz_name},
+        "start": {"dateTime": start_utc.astimezone(tz).isoformat(), "timeZone": normalize_tz_name_for_zoneinfo(tz_name)},
+        "end": {"dateTime": end_utc.astimezone(tz).isoformat(), "timeZone": normalize_tz_name_for_zoneinfo(tz_name)},
     }
     if attendees and isinstance(attendees, list):
         body["attendees"] = [
@@ -811,10 +973,10 @@ def google_patch_event_time_api(
     end_utc: datetime,
     tz_name: str,
 ) -> Dict[str, Any]:
-    tz = ZoneInfo(tz_name)
+    tz = zoneinfo_from_any_tz(tz_name)
     body = {
-        "start": {"dateTime": start_utc.astimezone(tz).isoformat(), "timeZone": tz_name},
-        "end": {"dateTime": end_utc.astimezone(tz).isoformat(), "timeZone": tz_name},
+        "start": {"dateTime": start_utc.astimezone(tz).isoformat(), "timeZone": normalize_tz_name_for_zoneinfo(tz_name)},
+        "end": {"dateTime": end_utc.astimezone(tz).isoformat(), "timeZone": normalize_tz_name_for_zoneinfo(tz_name)},
     }
     url = GOOGLE_EVENT_URL.format(calendarId=safe_cal_id(calendar_id), eventId=safe_event_id(event_id))
     r = requests.patch(
@@ -1028,7 +1190,7 @@ def microsoft_calendar_view_all_pages(
         return items
 
     j = r["json"] or {}
-    items.extend(j.get("value") or [])
+    items.extend((j.get("value") or []))
 
     next_link = j.get("@odata.nextLink")
     safety = 0
@@ -1038,7 +1200,7 @@ def microsoft_calendar_view_all_pages(
         if rr["statusCode"] != 200 or not rr["json"]:
             break
         jj = rr["json"] or {}
-        items.extend(jj.get("value") or [])
+        items.extend((jj.get("value") or []))
         next_link = jj.get("@odata.nextLink")
 
     return items
@@ -1066,7 +1228,7 @@ def microsoft_get_schedule_api(
     }
     r = requests.post(
         MS_GET_SCHEDULE_URL,
-        headers={**_graph_headers(access_token, prefer_tz=time_zone), "Content-Type": "application/json"},
+        headers={**_graph_headers(access_token, prefer_tz="UTC"), "Content-Type": "application/json"},
         data=json.dumps(body),
         timeout=30,
     )
@@ -1160,10 +1322,12 @@ def microsoft_event_time_to_utc(dt_obj: Dict[str, Any]) -> Optional[datetime]:
     if not raw:
         return None
 
+    tz = zoneinfo_from_any_tz(tz_name)
+
     try:
         dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=ZoneInfo(tz_name))
+            dt = dt.replace(tzinfo=tz)
         return dt.astimezone(timezone.utc)
     except Exception:
         pass
@@ -1171,14 +1335,14 @@ def microsoft_event_time_to_utc(dt_obj: Dict[str, Any]) -> Optional[datetime]:
     try:
         raw2 = raw.split(".")[0]
         dt = datetime.fromisoformat(raw2)
-        dt = dt.replace(tzinfo=ZoneInfo(tz_name))
+        dt = dt.replace(tzinfo=tz)
         return dt.astimezone(timezone.utc)
     except Exception:
         pass
 
     try:
         dt = datetime.strptime(raw[:10], "%Y-%m-%d")
-        dt = dt.replace(tzinfo=ZoneInfo(tz_name))
+        dt = dt.replace(tzinfo=tz)
         return dt.astimezone(timezone.utc)
     except Exception:
         return None
@@ -1215,7 +1379,7 @@ def microsoft_collect_busy_utc(
                 schedule_email=schedule_email,
                 time_min_utc=time_min_utc,
                 time_max_utc=time_max_utc,
-                time_zone=tz_name,
+                time_zone="UTC",
                 availability_view_interval=30,
             )
             if sched["statusCode"] == 200 and sched["json"]:
@@ -1434,7 +1598,7 @@ def compute_availability_from_busy(
     preferred_utc: Optional[datetime] = None,
     preference: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    tz = ZoneInfo(tz_name)
+    tz = zoneinfo_from_any_tz(tz_name)
     now_local = datetime.now(tz).replace(second=0, microsecond=0)
 
     start_day = now_local.date()
@@ -1512,7 +1676,7 @@ def provider_search_events(
     time_min: datetime,
     time_max: datetime,
 ) -> List[Dict[str, Any]]:
-    tz = ZoneInfo(tz_name)
+    tz = zoneinfo_from_any_tz(tz_name)
     matches: List[Dict[str, Any]] = []
 
     if provider == PROVIDER_GOOGLE:
@@ -1856,7 +2020,7 @@ def check_availability_handler(provider: str, request: Request, payload: Dict[st
     ]
 
     is_free = len(overlaps_found) == 0
-    tz = ZoneInfo(tz_name)
+    tz = zoneinfo_from_any_tz(tz_name)
 
     return {
         "ok": True,
@@ -1914,7 +2078,7 @@ def availability_handler(provider: str, request: Request, payload: Dict[str, Any
     rt = load_refresh_token(provider, customer_id)
     access_token = refresh_access_token(provider, rt)
 
-    tz = ZoneInfo(tz_name)
+    tz = zoneinfo_from_any_tz(tz_name)
     now_local = datetime.now(tz).replace(second=0, microsecond=0)
     start_day = now_local.date()
     end_day = start_day + timedelta(days=max(1, days))
