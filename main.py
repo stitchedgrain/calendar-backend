@@ -18,7 +18,7 @@ from sqlalchemy.engine import Engine
 # =============================================================================
 # App
 # =============================================================================
-app = FastAPI(title="Calendar Backend", version="3.4.1")
+app = FastAPI(title="Calendar Backend", version="3.5.0")
 
 # =============================================================================
 # Env
@@ -56,6 +56,7 @@ GOOGLE_CALENDAR_LIST_URL = "https://www.googleapis.com/calendar/v3/users/me/cale
 GOOGLE_FREEBUSY_URL = "https://www.googleapis.com/calendar/v3/freeBusy"
 GOOGLE_EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/{calendarId}/events"
 GOOGLE_EVENT_URL = "https://www.googleapis.com/calendar/v3/calendars/{calendarId}/events/{eventId}"
+
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/calendar",
     "openid",
@@ -68,12 +69,14 @@ GOOGLE_SCOPES = [
 # =============================================================================
 MS_AUTHORIZE_URL = f"https://login.microsoftonline.com/{MS_TENANT}/oauth2/v2.0/authorize"
 MS_TOKEN_URL = f"https://login.microsoftonline.com/{MS_TENANT}/oauth2/v2.0/token"
+
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 MS_ME_URL = f"{GRAPH_BASE}/me"
 MS_LIST_CALENDARS_URL = f"{GRAPH_BASE}/me/calendars"
 MS_CALENDARVIEW_URL = f"{GRAPH_BASE}/me/calendars/{{calendarId}}/calendarView"
 MS_CREATE_EVENT_URL = f"{GRAPH_BASE}/me/calendars/{{calendarId}}/events"
 MS_EVENT_URL = f"{GRAPH_BASE}/me/events/{{eventId}}"
+
 MS_SCOPES = [
     "offline_access",
     "openid",
@@ -193,61 +196,56 @@ engine = make_engine()
 def init_db() -> None:
     ddl = """
     CREATE TABLE IF NOT EXISTS oauth_states (
-      state TEXT PRIMARY KEY,
+      state       TEXT PRIMARY KEY,
       customer_id TEXT NOT NULL,
-      provider TEXT NOT NULL DEFAULT 'google',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      provider    TEXT NOT NULL DEFAULT 'google',
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS oauth_tokens (
-      provider TEXT NOT NULL,
-      customer_id TEXT NOT NULL,
-      user_email TEXT NOT NULL,
+      provider      TEXT NOT NULL,
+      customer_id   TEXT NOT NULL,
+      user_email    TEXT NOT NULL,
       refresh_token TEXT NOT NULL,
-      scope TEXT,
-      token_type TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      scope         TEXT,
+      token_type    TEXT,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       PRIMARY KEY (provider, customer_id)
     );
 
     CREATE TABLE IF NOT EXISTS customer_calendars (
-      provider TEXT NOT NULL,
+      provider    TEXT NOT NULL,
       customer_id TEXT NOT NULL,
       calendar_id TEXT NOT NULL,
-      summary TEXT,
+      summary     TEXT,
       primary_cal BOOLEAN NOT NULL DEFAULT FALSE,
-      selected BOOLEAN NOT NULL DEFAULT FALSE,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      selected    BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       PRIMARY KEY (provider, customer_id, calendar_id)
     );
 
     CREATE TABLE IF NOT EXISTS customer_settings (
-      customer_id TEXT PRIMARY KEY,
-      timezone TEXT NOT NULL DEFAULT 'America/Denver',
-      work_start_hour INT NOT NULL DEFAULT 9,
-      work_end_hour INT NOT NULL DEFAULT 17,
-      work_days TEXT NOT NULL DEFAULT '[0,1,2,3,4]',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      customer_id     TEXT PRIMARY KEY,
+      timezone        TEXT NOT NULL DEFAULT 'America/Denver',
+      work_start_hour INT  NOT NULL DEFAULT 9,
+      work_end_hour   INT  NOT NULL DEFAULT 17,
+      work_days       TEXT NOT NULL DEFAULT '[0,1,2,3,4]',
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     """
     with engine.begin() as conn:
         conn.execute(text(ddl))
 
         cols = conn.execute(
-            text(
-                """
+            text("""
                 SELECT column_name
                 FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='oauth_states'
-                """
-            )
+            """)
         ).fetchall()
-
         col_names = {r[0] for r in cols}
         if "provider" not in col_names:
-            conn.execute(
-                text("ALTER TABLE oauth_states ADD COLUMN provider TEXT NOT NULL DEFAULT 'google'")
-            )
+            conn.execute(text("ALTER TABLE oauth_states ADD COLUMN provider TEXT NOT NULL DEFAULT 'google'"))
 
 
 init_db()
@@ -350,17 +348,14 @@ def merge_intervals_dt(intervals: List[Tuple[datetime, datetime]]) -> List[Tuple
     cleaned = [(s, e) for s, e in intervals if e > s]
     if not cleaned:
         return []
-
     cleaned.sort(key=lambda x: x[0])
     out: List[List[datetime]] = [[cleaned[0][0], cleaned[0][1]]]
-
     for s, e in cleaned[1:]:
         last = out[-1]
         if s <= last[1]:
             last[1] = max(last[1], e)
         else:
             out.append([s, e])
-
     return [(a, b) for a, b in out]
 
 
@@ -382,17 +377,15 @@ def slot_is_free(
     while j < len(merged_busy) and merged_busy[j][0] < slot_end:
         bs, be = merged_busy[j]
         if overlaps(slot_start, slot_end, bs, be):
-            return False, i
+            return (False, i)
         j += 1
-
-    return True, i
+    return (True, i)
 
 
 def round_up_to_step(dt_utc: datetime, step_minutes: int) -> datetime:
     dt_utc = dt_utc.astimezone(timezone.utc).replace(second=0, microsecond=0)
     if step_minutes <= 1:
         return dt_utc
-
     epoch = int(dt_utc.timestamp())
     step = step_minutes * 60
     rounded = ((epoch + step - 1) // step) * step
@@ -437,7 +430,6 @@ def pick_by_preference(
         return True
 
     filtered = [x for x in available if matches_filters(x, tod)]
-
     if not filtered and tod in ("morning", "afternoon"):
         alt = "afternoon" if tod == "morning" else "morning"
         filtered = [x for x in available if matches_filters(x, alt)]
@@ -448,15 +440,12 @@ def pick_by_preference(
     strategy = str(pref.get("strategy", "soonest")).strip().lower()
 
     if strategy == "closest" and preferred_utc is not None:
-        filtered.sort(
-            key=lambda x: abs((parse_iso_to_utc(x["startUtc"]) - preferred_utc).total_seconds())
-        )
+        filtered.sort(key=lambda x: abs((parse_iso_to_utc(x["startUtc"]) - preferred_utc).total_seconds()))
         return filtered[:max_results]
 
     if strategy == "spread":
         if len(filtered) <= max_results:
             return filtered
-
         step = max(1, len(filtered) // max_results)
         out = []
         idx = 0
@@ -473,15 +462,13 @@ def pick_by_preference(
 # DB accessors
 # =============================================================================
 def upsert_oauth_state(state: str, customer_id: str, provider: str) -> None:
-    q = text(
-        """
+    q = text("""
         INSERT INTO oauth_states(state, customer_id, provider)
         VALUES (:state, :cid, :provider)
         ON CONFLICT (state) DO UPDATE SET
           customer_id = EXCLUDED.customer_id,
           provider = EXCLUDED.provider
-        """
-    )
+    """)
     with engine.begin() as conn:
         conn.execute(q, {"state": state, "cid": customer_id, "provider": provider})
 
@@ -492,10 +479,8 @@ def consume_oauth_state(state: str) -> Optional[Dict[str, str]]:
             text("SELECT customer_id, provider FROM oauth_states WHERE state=:s"),
             {"s": state},
         ).fetchone()
-
         if not row:
             return None
-
         conn.execute(text("DELETE FROM oauth_states WHERE state=:s"), {"s": state})
         return {"customer_id": row[0], "provider": row[1]}
 
@@ -508,8 +493,7 @@ def save_oauth_token(
     scope: str,
     token_type: str,
 ) -> None:
-    q = text(
-        """
+    q = text("""
         INSERT INTO oauth_tokens(provider, customer_id, user_email, refresh_token, scope, token_type)
         VALUES (:p, :cid, :email, :rt, :scope, :tt)
         ON CONFLICT (provider, customer_id) DO UPDATE SET
@@ -517,8 +501,7 @@ def save_oauth_token(
           refresh_token = EXCLUDED.refresh_token,
           scope = EXCLUDED.scope,
           token_type = EXCLUDED.token_type
-        """
-    )
+    """)
     with engine.begin() as conn:
         conn.execute(
             q,
@@ -536,35 +519,22 @@ def save_oauth_token(
 def load_refresh_token(provider: str, customer_id: str) -> str:
     with engine.begin() as conn:
         row = conn.execute(
-            text(
-                """
-                SELECT refresh_token
-                FROM oauth_tokens
-                WHERE provider=:p AND customer_id=:cid
-                """
-            ),
+            text("SELECT refresh_token FROM oauth_tokens WHERE provider=:p AND customer_id=:cid"),
             {"p": provider, "cid": customer_id},
         ).fetchone()
-
         if not row:
-            raise HTTPException(
-                status_code=400,
-                detail=f"{provider} not connected for this customerId",
-            )
-
+            raise HTTPException(status_code=400, detail=f"{provider} not connected for this customerId")
         return row[0]
 
 
 def ensure_customer_settings(customer_id: str) -> Dict[str, Any]:
     with engine.begin() as conn:
         row = conn.execute(
-            text(
-                """
+            text("""
                 SELECT timezone, work_start_hour, work_end_hour, work_days
                 FROM customer_settings
                 WHERE customer_id=:cid
-                """
-            ),
+            """),
             {"cid": customer_id},
         ).fetchone()
 
@@ -577,15 +547,12 @@ def ensure_customer_settings(customer_id: str) -> Dict[str, Any]:
             }
 
         conn.execute(
-            text(
-                """
+            text("""
                 INSERT INTO customer_settings(customer_id, timezone, work_start_hour, work_end_hour, work_days)
                 VALUES (:cid, 'America/Denver', 9, 17, '[0,1,2,3,4]')
-                """
-            ),
+            """),
             {"cid": customer_id},
         )
-
         return {
             "timezone": "America/Denver",
             "work_start_hour": 9,
@@ -614,8 +581,7 @@ def update_customer_settings(
 
     with engine.begin() as conn:
         conn.execute(
-            text(
-                """
+            text("""
                 INSERT INTO customer_settings(customer_id, timezone, work_start_hour, work_end_hour, work_days)
                 VALUES (:cid, :tz, :ws, :we, :wd)
                 ON CONFLICT (customer_id) DO UPDATE SET
@@ -623,87 +589,21 @@ def update_customer_settings(
                   work_start_hour = EXCLUDED.work_start_hour,
                   work_end_hour = EXCLUDED.work_end_hour,
                   work_days = EXCLUDED.work_days
-                """
-            ),
-            {
-                "cid": customer_id,
-                "tz": tz_name,
-                "ws": work_start,
-                "we": work_end,
-                "wd": json.dumps(work_days),
-            },
+            """),
+            {"cid": customer_id, "tz": tz_name, "ws": work_start, "we": work_end, "wd": json.dumps(work_days)},
         )
-
     return ensure_customer_settings(customer_id)
-
-
-def upsert_calendars(provider: str, customer_id: str, calendars: List[Dict[str, Any]]) -> None:
-    q = text(
-        """
-        INSERT INTO customer_calendars(provider, customer_id, calendar_id, summary, primary_cal, selected)
-        VALUES (:p, :cid, :calid, :summary, :primary, :selected)
-        ON CONFLICT (provider, customer_id, calendar_id) DO UPDATE SET
-          summary = EXCLUDED.summary,
-          primary_cal = EXCLUDED.primary_cal
-        """
-    )
-
-    with engine.begin() as conn:
-        for c in calendars:
-            calid = c.get("id")
-            if not calid:
-                continue
-
-            primary = bool(c.get("primary", False))
-            selected = True if primary else False
-
-            conn.execute(
-                q,
-                {
-                    "p": provider,
-                    "cid": customer_id,
-                    "calid": calid,
-                    "summary": c.get("summary"),
-                    "primary": primary,
-                    "selected": selected,
-                },
-            )
-
-        count_sel = conn.execute(
-            text(
-                """
-                SELECT COUNT(*)
-                FROM customer_calendars
-                WHERE provider=:p AND customer_id=:cid AND selected=true
-                """
-            ),
-            {"p": provider, "cid": customer_id},
-        ).scalar_one()
-
-        if count_sel == 0:
-            conn.execute(
-                text(
-                    """
-                    UPDATE customer_calendars
-                    SET selected=true
-                    WHERE provider=:p AND customer_id=:cid AND primary_cal=true
-                    """
-                ),
-                {"p": provider, "cid": customer_id},
-            )
 
 
 def list_calendars_db(provider: str, customer_id: str) -> List[Dict[str, Any]]:
     with engine.begin() as conn:
         rows = conn.execute(
-            text(
-                """
+            text("""
                 SELECT calendar_id, summary, primary_cal, selected
                 FROM customer_calendars
                 WHERE provider=:p AND customer_id=:cid
                 ORDER BY primary_cal DESC, summary NULLS LAST, calendar_id
-                """
-            ),
+            """),
             {"p": provider, "cid": customer_id},
         ).fetchall()
 
@@ -724,60 +624,39 @@ def set_selected_calendars(provider: str, customer_id: str, calendar_ids: List[s
 
     with engine.begin() as conn:
         conn.execute(
-            text(
-                """
-                UPDATE customer_calendars
-                SET selected=false
-                WHERE provider=:p AND customer_id=:cid
-                """
-            ),
+            text("UPDATE customer_calendars SET selected=false WHERE provider=:p AND customer_id=:cid"),
             {"p": provider, "cid": customer_id},
         )
-
         conn.execute(
-            text(
-                """
+            text("""
                 UPDATE customer_calendars
                 SET selected=true
                 WHERE provider=:p AND customer_id=:cid AND calendar_id = ANY(:ids)
-                """
-            ),
+            """),
             {"p": provider, "cid": customer_id, "ids": calendar_ids},
         )
-
         cnt = conn.execute(
-            text(
-                """
+            text("""
                 SELECT COUNT(*)
                 FROM customer_calendars
                 WHERE provider=:p AND customer_id=:cid AND selected=true
-                """
-            ),
+            """),
             {"p": provider, "cid": customer_id},
         ).scalar_one()
 
         if cnt == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="None of the provided calendarIds exist for this customerId",
-            )
+            raise HTTPException(status_code=400, detail="None of the provided calendarIds exist for this customerId")
 
 
-def selected_calendar_ids(
-    provider: str,
-    customer_id: str,
-    default_fallback: Optional[str] = None,
-) -> List[str]:
+def selected_calendar_ids(provider: str, customer_id: str, default_fallback: Optional[str] = None) -> List[str]:
     with engine.begin() as conn:
         rows = conn.execute(
-            text(
-                """
+            text("""
                 SELECT calendar_id
                 FROM customer_calendars
                 WHERE provider=:p AND customer_id=:cid AND selected=true
                 ORDER BY primary_cal DESC, calendar_id
-                """
-            ),
+            """),
             {"p": provider, "cid": customer_id},
         ).fetchall()
 
@@ -785,6 +664,61 @@ def selected_calendar_ids(
     if ids:
         return ids
     return [default_fallback] if default_fallback else []
+
+
+def replace_customer_calendars(provider: str, customer_id: str, calendars: List[Dict[str, Any]]) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                DELETE FROM customer_calendars
+                WHERE provider=:p AND customer_id=:cid
+            """),
+            {"p": provider, "cid": customer_id},
+        )
+
+        q = text("""
+            INSERT INTO customer_calendars(provider, customer_id, calendar_id, summary, primary_cal, selected)
+            VALUES (:p, :cid, :calid, :summary, :primary, :selected)
+        """)
+
+        inserted_primary = False
+        first_id: Optional[str] = None
+
+        for c in calendars:
+            calid = c.get("id")
+            if not calid:
+                continue
+
+            if first_id is None:
+                first_id = calid
+
+            primary = bool(c.get("primary", False))
+            selected = primary
+
+            if primary:
+                inserted_primary = True
+
+            conn.execute(
+                q,
+                {
+                    "p": provider,
+                    "cid": customer_id,
+                    "calid": calid,
+                    "summary": c.get("summary"),
+                    "primary": primary,
+                    "selected": selected,
+                },
+            )
+
+        if calendars and not inserted_primary and first_id:
+            conn.execute(
+                text("""
+                    UPDATE customer_calendars
+                    SET selected=true
+                    WHERE provider=:p AND customer_id=:cid AND calendar_id=:calid
+                """),
+                {"p": provider, "cid": customer_id, "calid": first_id},
+            )
 
 
 # =============================================================================
@@ -832,19 +766,12 @@ def refresh_google_access_token(refresh_token: str) -> str:
     )
     j = safe_json(r) or {}
     if r.status_code != 200 or "access_token" not in j:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to refresh Google access token: {r.text}",
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to refresh Google access token: {r.text}")
     return j["access_token"]
 
 
 def google_userinfo(access_token: str) -> Dict[str, Any]:
-    r = requests.get(
-        GOOGLE_USERINFO_URL,
-        headers={"Authorization": f"Bearer {access_token}"},
-        timeout=30,
-    )
+    r = requests.get(GOOGLE_USERINFO_URL, headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
     j = safe_json(r)
     if r.status_code != 200 or not j:
         raise HTTPException(status_code=500, detail=f"Failed to fetch Google userinfo: {r.text}")
@@ -852,11 +779,7 @@ def google_userinfo(access_token: str) -> Dict[str, Any]:
 
 
 def google_calendar_list_api(access_token: str) -> Dict[str, Any]:
-    r = requests.get(
-        GOOGLE_CALENDAR_LIST_URL,
-        headers={"Authorization": f"Bearer {access_token}"},
-        timeout=30,
-    )
+    r = requests.get(GOOGLE_CALENDAR_LIST_URL, headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
     return {"statusCode": r.status_code, "json": safe_json(r), "text": r.text}
 
 
@@ -875,19 +798,11 @@ def google_freebusy_raw(
     }
     r = requests.post(
         GOOGLE_FREEBUSY_URL,
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-        },
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
         data=json.dumps(body),
         timeout=30,
     )
-    return {
-        "statusCode": r.status_code,
-        "json": safe_json(r),
-        "text": r.text,
-        "requestBody": body,
-    }
+    return {"statusCode": r.status_code, "json": safe_json(r), "text": r.text, "requestBody": body}
 
 
 def google_list_events_api(
@@ -926,16 +841,9 @@ def google_create_event_api(
     body: Dict[str, Any] = {
         "summary": summary,
         "description": description,
-        "start": {
-            "dateTime": start_utc.astimezone(tz).isoformat(),
-            "timeZone": normalize_tz_name_for_zoneinfo(tz_name, "UTC"),
-        },
-        "end": {
-            "dateTime": end_utc.astimezone(tz).isoformat(),
-            "timeZone": normalize_tz_name_for_zoneinfo(tz_name, "UTC"),
-        },
+        "start": {"dateTime": start_utc.astimezone(tz).isoformat(), "timeZone": normalize_tz_name_for_zoneinfo(tz_name, "UTC")},
+        "end": {"dateTime": end_utc.astimezone(tz).isoformat(), "timeZone": normalize_tz_name_for_zoneinfo(tz_name, "UTC")},
     }
-
     if attendees and isinstance(attendees, list):
         body["attendees"] = [
             {"email": (a.get("email") or "").strip()}
@@ -947,26 +855,15 @@ def google_create_event_api(
     r = requests.post(
         url,
         params={"sendUpdates": "none"},
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-        },
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
         data=json.dumps(body),
         timeout=30,
     )
-    return {
-        "statusCode": r.status_code,
-        "json": safe_json(r),
-        "text": r.text,
-        "requestBody": body,
-    }
+    return {"statusCode": r.status_code, "json": safe_json(r), "text": r.text, "requestBody": body}
 
 
 def google_delete_event_api(access_token: str, calendar_id: str, event_id: str) -> Dict[str, Any]:
-    url = GOOGLE_EVENT_URL.format(
-        calendarId=safe_cal_id(calendar_id),
-        eventId=safe_event_id(event_id),
-    )
+    url = GOOGLE_EVENT_URL.format(calendarId=safe_cal_id(calendar_id), eventId=safe_event_id(event_id))
     r = requests.delete(
         url,
         params={"sendUpdates": "none"},
@@ -986,36 +883,18 @@ def google_patch_event_time_api(
 ) -> Dict[str, Any]:
     tz = zoneinfo_from_any_tz(tz_name, fallback="UTC")
     body = {
-        "start": {
-            "dateTime": start_utc.astimezone(tz).isoformat(),
-            "timeZone": normalize_tz_name_for_zoneinfo(tz_name, "UTC"),
-        },
-        "end": {
-            "dateTime": end_utc.astimezone(tz).isoformat(),
-            "timeZone": normalize_tz_name_for_zoneinfo(tz_name, "UTC"),
-        },
+        "start": {"dateTime": start_utc.astimezone(tz).isoformat(), "timeZone": normalize_tz_name_for_zoneinfo(tz_name, "UTC")},
+        "end": {"dateTime": end_utc.astimezone(tz).isoformat(), "timeZone": normalize_tz_name_for_zoneinfo(tz_name, "UTC")},
     }
-
-    url = GOOGLE_EVENT_URL.format(
-        calendarId=safe_cal_id(calendar_id),
-        eventId=safe_event_id(event_id),
-    )
+    url = GOOGLE_EVENT_URL.format(calendarId=safe_cal_id(calendar_id), eventId=safe_event_id(event_id))
     r = requests.patch(
         url,
         params={"sendUpdates": "none"},
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-        },
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
         data=json.dumps(body),
         timeout=30,
     )
-    return {
-        "statusCode": r.status_code,
-        "json": safe_json(r),
-        "text": r.text,
-        "requestBody": body,
-    }
+    return {"statusCode": r.status_code, "json": safe_json(r), "text": r.text, "requestBody": body}
 
 
 def google_collect_busy_utc(
@@ -1047,16 +926,13 @@ def google_collect_busy_utc(
         r = google_list_events_api(access_token, cid, time_min_utc, time_max_utc)
         if r["statusCode"] != 200 or not r["json"]:
             continue
-
         for ev in (r["json"].get("items") or []):
             if ev.get("status") == "cancelled":
                 continue
-
             start = (ev.get("start") or {}).get("dateTime")
             end = (ev.get("end") or {}).get("dateTime")
             if not start or not end:
                 continue
-
             try:
                 s_utc = parse_iso_to_utc(start)
                 e_utc = parse_iso_to_utc(end)
@@ -1087,23 +963,19 @@ def google_collect_busy_utc_excluding_event(
     exclude_event_id: str,
 ) -> List[Tuple[datetime, datetime]]:
     busy_intervals: List[Tuple[datetime, datetime]] = []
-
     for cid in calendar_ids:
         r = google_list_events_api(access_token, cid, time_min_utc, time_max_utc)
         if r["statusCode"] != 200 or not r["json"]:
             continue
-
         for ev in (r["json"].get("items") or []):
             if ev.get("status") == "cancelled":
                 continue
             if cid == exclude_calendar_id and (ev.get("id") or "") == exclude_event_id:
                 continue
-
             start = (ev.get("start") or {}).get("dateTime")
             end = (ev.get("end") or {}).get("dateTime")
             if not start or not end:
                 continue
-
             try:
                 s_utc = parse_iso_to_utc(start)
                 e_utc = parse_iso_to_utc(end)
@@ -1111,7 +983,6 @@ def google_collect_busy_utc_excluding_event(
                     busy_intervals.append((s_utc, e_utc))
             except Exception:
                 continue
-
     return merge_intervals_dt(busy_intervals)
 
 
@@ -1161,10 +1032,7 @@ def refresh_microsoft_access_token(refresh_token: str) -> str:
     )
     j = safe_json(r) or {}
     if r.status_code != 200 or "access_token" not in j:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to refresh Microsoft access token: {r.text}",
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to refresh Microsoft access token: {r.text}")
     return j["access_token"]
 
 
@@ -1196,7 +1064,11 @@ def microsoft_calendar_view_api(
     next_link: Optional[str] = None,
 ) -> Dict[str, Any]:
     if next_link:
-        r = requests.get(next_link, headers=_graph_headers(access_token), timeout=30)
+        r = requests.get(
+            next_link,
+            headers=_graph_headers(access_token),
+            timeout=30,
+        )
         return {"statusCode": r.status_code, "json": safe_json(r), "text": r.text}
 
     url = MS_CALENDARVIEW_URL.format(calendarId=safe_cal_id(calendar_id))
@@ -1226,25 +1098,17 @@ def microsoft_calendar_view_all_pages(
         return items
 
     j = r["json"] or {}
-    items.extend(j.get("value") or [])
+    items.extend((j.get("value") or []))
 
     next_link = j.get("@odata.nextLink")
     safety = 0
-
     while next_link and safety < 20:
         safety += 1
-        rr = microsoft_calendar_view_api(
-            access_token,
-            calendar_id,
-            time_min_utc,
-            time_max_utc,
-            next_link=next_link,
-        )
+        rr = microsoft_calendar_view_api(access_token, calendar_id, time_min_utc, time_max_utc, next_link=next_link)
         if rr["statusCode"] != 200 or not rr["json"]:
             break
-
         jj = rr["json"] or {}
-        items.extend(jj.get("value") or [])
+        items.extend((jj.get("value") or []))
         next_link = jj.get("@odata.nextLink")
 
     return items
@@ -1292,12 +1156,7 @@ def microsoft_create_event_api(
         data=json.dumps(body),
         timeout=30,
     )
-    return {
-        "statusCode": r.status_code,
-        "json": safe_json(r),
-        "text": r.text,
-        "requestBody": body,
-    }
+    return {"statusCode": r.status_code, "json": safe_json(r), "text": r.text, "requestBody": body}
 
 
 def microsoft_delete_event_api(access_token: str, event_id: str) -> Dict[str, Any]:
@@ -1323,7 +1182,6 @@ def microsoft_patch_event_time_api(
             "timeZone": "UTC",
         },
     }
-
     url = MS_EVENT_URL.format(eventId=safe_event_id(event_id))
     r = requests.patch(
         url,
@@ -1331,18 +1189,10 @@ def microsoft_patch_event_time_api(
         data=json.dumps(body),
         timeout=30,
     )
-    return {
-        "statusCode": r.status_code,
-        "json": safe_json(r),
-        "text": r.text,
-        "requestBody": body,
-    }
+    return {"statusCode": r.status_code, "json": safe_json(r), "text": r.text, "requestBody": body}
 
 
-def microsoft_event_time_to_utc(
-    dt_obj: Dict[str, Any],
-    fallback_tz_name: str = "UTC",
-) -> Optional[datetime]:
+def microsoft_event_time_to_utc(dt_obj: Dict[str, Any], fallback_tz_name: str = "UTC") -> Optional[datetime]:
     if not isinstance(dt_obj, dict):
         return None
 
@@ -1351,10 +1201,7 @@ def microsoft_event_time_to_utc(
     if not raw:
         return None
 
-    tz = zoneinfo_from_any_tz(
-        tz_name,
-        fallback=normalize_tz_name_for_zoneinfo(fallback_tz_name, "UTC"),
-    )
+    tz = zoneinfo_from_any_tz(tz_name, fallback=normalize_tz_name_for_zoneinfo(fallback_tz_name, "UTC"))
 
     try:
         dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
@@ -1387,7 +1234,13 @@ def microsoft_collect_busy_utc(
     calendar_view_busy_count = 0
 
     for cid in calendar_ids:
-        items = microsoft_calendar_view_all_pages(access_token, cid, time_min_utc, time_max_utc)
+        items = microsoft_calendar_view_all_pages(
+            access_token,
+            cid,
+            time_min_utc,
+            time_max_utc,
+        )
+
         for ev in items:
             calendar_view_event_count += 1
 
@@ -1395,11 +1248,19 @@ def microsoft_collect_busy_utc(
                 continue
 
             show_as = str(ev.get("showAs") or "").strip().lower()
+
+            # only explicit free is ignored
             if show_as == "free":
                 continue
 
-            s_utc = microsoft_event_time_to_utc(ev.get("start") or {}, fallback_tz_name=tz_name)
-            e_utc = microsoft_event_time_to_utc(ev.get("end") or {}, fallback_tz_name=tz_name)
+            s_utc = microsoft_event_time_to_utc(
+                ev.get("start") or {},
+                fallback_tz_name=tz_name,
+            )
+            e_utc = microsoft_event_time_to_utc(
+                ev.get("end") or {},
+                fallback_tz_name=tz_name,
+            )
 
             if not s_utc or not e_utc:
                 continue
@@ -1410,12 +1271,16 @@ def microsoft_collect_busy_utc(
             calendar_view_busy_count += 1
 
     merged = merge_intervals_dt(busy)
+
     return {
         "ok": True,
         "checkedCalendars": list(calendar_ids),
         "timeMinUtc": iso_z(time_min_utc),
         "timeMaxUtc": iso_z(time_max_utc),
-        "busyMerged": [{"startUtc": iso_z(s), "endUtc": iso_z(e)} for s, e in merged],
+        "busyMerged": [
+            {"startUtc": iso_z(s), "endUtc": iso_z(e)}
+            for s, e in merged
+        ],
         "debug": {
             "calendarViewEventCount": calendar_view_event_count,
             "calendarViewBusyCount": calendar_view_busy_count,
@@ -1435,6 +1300,7 @@ def microsoft_collect_busy_utc_excluding_event(
 
     for cid in calendar_ids:
         items = microsoft_calendar_view_all_pages(access_token, cid, time_min_utc, time_max_utc)
+
         for ev in items:
             if (ev.get("id") or "") == exclude_event_id:
                 continue
@@ -1445,14 +1311,8 @@ def microsoft_collect_busy_utc_excluding_event(
             if show_as == "free":
                 continue
 
-            s_utc = microsoft_event_time_to_utc(
-                ev.get("start") or {},
-                fallback_tz_name=fallback_tz_name,
-            )
-            e_utc = microsoft_event_time_to_utc(
-                ev.get("end") or {},
-                fallback_tz_name=fallback_tz_name,
-            )
+            s_utc = microsoft_event_time_to_utc(ev.get("start") or {}, fallback_tz_name=fallback_tz_name)
+            e_utc = microsoft_event_time_to_utc(ev.get("end") or {}, fallback_tz_name=fallback_tz_name)
 
             if not s_utc or not e_utc or e_utc <= s_utc:
                 continue
@@ -1504,19 +1364,13 @@ def refresh_access_token(provider: str, refresh_token: str) -> str:
 def fetch_user_email(provider: str, access_token: str) -> str:
     if provider == PROVIDER_GOOGLE:
         return (google_userinfo(access_token) or {}).get("email", "unknown")
-
     if provider == PROVIDER_MICROSOFT:
         me = microsoft_me(access_token)
         return (me.get("mail") or me.get("userPrincipalName") or "unknown").strip()
-
     raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}")
 
 
-def sync_calendars_from_provider(
-    provider: str,
-    customer_id: str,
-    access_token: str,
-) -> List[Dict[str, Any]]:
+def sync_calendars_from_provider(provider: str, customer_id: str, access_token: str) -> List[Dict[str, Any]]:
     keep: List[Dict[str, Any]] = []
 
     if provider == PROVIDER_GOOGLE:
@@ -1530,7 +1384,9 @@ def sync_calendars_from_provider(
                     "primary": bool(it.get("primary", False)),
                 }
                 for it in items
+                if it.get("id")
             ]
+
     elif provider == PROVIDER_MICROSOFT:
         cal_list = microsoft_list_calendars_api(access_token)
         if cal_list["statusCode"] == 200 and cal_list["json"]:
@@ -1539,16 +1395,15 @@ def sync_calendars_from_provider(
                 {
                     "id": it.get("id"),
                     "summary": it.get("name"),
-                    "primary": (idx == 0),
+                    "primary": bool(it.get("isDefaultCalendar", False)),
                 }
-                for idx, it in enumerate(items)
+                for it in items
+                if it.get("id")
             ]
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}")
 
-    if keep:
-        upsert_calendars(provider, customer_id, keep)
-
+    replace_customer_calendars(provider, customer_id, keep)
     return keep
 
 
@@ -1614,22 +1469,17 @@ def compute_availability_from_busy(
 ) -> Dict[str, Any]:
     tz = zoneinfo_from_any_tz(tz_name, fallback="UTC")
     now_local = datetime.now(tz).replace(second=0, microsecond=0)
+
     start_day = now_local.date()
     end_day = start_day + timedelta(days=max(1, int(days)))
+    horizon_end_local = datetime(end_day.year, end_day.month, end_day.day, work_end_hour, 0, tzinfo=tz)
 
-    horizon_end_local = datetime(
-        end_day.year,
-        end_day.month,
-        end_day.day,
-        work_end_hour,
-        0,
-        tzinfo=tz,
-    )
     time_min_utc = now_local.astimezone(timezone.utc)
     time_max_utc = horizon_end_local.astimezone(timezone.utc)
 
     dur = timedelta(minutes=int(duration_minutes))
     step = timedelta(minutes=int(step_minutes))
+
     available: List[Dict[str, str]] = []
     busy_ptr = 0
 
@@ -1657,6 +1507,7 @@ def compute_availability_from_busy(
         while t <= last_start:
             slot_start = t
             slot_end = t + dur
+
             free, busy_ptr = slot_is_free(slot_start, slot_end, merged_busy, busy_ptr)
             if free:
                 available.append(
@@ -1675,10 +1526,7 @@ def compute_availability_from_busy(
     return {
         "ok": True,
         "timeZone": tz_name,
-        "window": {
-            "timeMinUtc": iso_z(time_min_utc),
-            "timeMaxUtc": iso_z(time_max_utc),
-        },
+        "window": {"timeMinUtc": iso_z(time_min_utc), "timeMaxUtc": iso_z(time_max_utc)},
         "busyMergedCount": len(merged_busy),
         "availableCount": len(available),
         "suggestions": suggestions,
@@ -1712,8 +1560,8 @@ def provider_search_events(
 
                 summ = ev.get("summary") or ""
                 desc = ev.get("description") or ""
-                hay_parts = [summ, desc]
 
+                hay_parts = [summ, desc]
                 if search_attendees:
                     for a in (ev.get("attendees") or []):
                         if isinstance(a, dict):
@@ -1764,16 +1612,14 @@ def provider_search_events(
 
                 subject = (ev.get("subject") or "").strip()
                 body_preview = (ev.get("bodyPreview") or "").strip()
-                hay_parts = [subject, body_preview]
 
+                hay_parts = [subject, body_preview]
                 if search_attendees:
                     for a in (ev.get("attendees") or []):
                         if isinstance(a, dict):
-                            email_address = a.get("emailAddress") or {}
-                            if isinstance(email_address, dict):
-                                addr = (email_address.get("address") or "").strip().lower()
-                                if addr:
-                                    hay_parts.append(addr)
+                            addr = (((a.get("emailAddress") or {}) if isinstance(a.get("emailAddress"), dict) else {}).get("address") or "").strip().lower()
+                            if addr:
+                                hay_parts.append(addr)
 
                 hay = "\n".join(hay_parts).lower()
                 hay_phone = digits_only("\n".join([subject, body_preview]))
@@ -1821,35 +1667,13 @@ def provider_create_event(
     attendees: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
     if provider == PROVIDER_GOOGLE:
-        return google_create_event_api(
-            access_token,
-            calendar_id,
-            summary,
-            description,
-            start_utc,
-            end_utc,
-            tz_name,
-            attendees,
-        )
+        return google_create_event_api(access_token, calendar_id, summary, description, start_utc, end_utc, tz_name, attendees)
     if provider == PROVIDER_MICROSOFT:
-        return microsoft_create_event_api(
-            access_token,
-            calendar_id,
-            summary,
-            description,
-            start_utc,
-            end_utc,
-            attendees,
-        )
+        return microsoft_create_event_api(access_token, calendar_id, summary, description, start_utc, end_utc, attendees)
     raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}")
 
 
-def provider_delete_event(
-    provider: str,
-    access_token: str,
-    calendar_id: str,
-    event_id: str,
-) -> Dict[str, Any]:
+def provider_delete_event(provider: str, access_token: str, calendar_id: str, event_id: str) -> Dict[str, Any]:
     if provider == PROVIDER_GOOGLE:
         return google_delete_event_api(access_token, calendar_id, event_id)
     if provider == PROVIDER_MICROSOFT:
@@ -1867,14 +1691,7 @@ def provider_patch_event_time(
     tz_name: str,
 ) -> Dict[str, Any]:
     if provider == PROVIDER_GOOGLE:
-        return google_patch_event_time_api(
-            access_token,
-            calendar_id,
-            event_id,
-            start_utc,
-            end_utc,
-            tz_name,
-        )
+        return google_patch_event_time_api(access_token, calendar_id, event_id, start_utc, end_utc, tz_name)
     if provider == PROVIDER_MICROSOFT:
         return microsoft_patch_event_time_api(access_token, event_id, start_utc, end_utc)
     raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}")
@@ -1893,7 +1710,6 @@ def oauth_start_handler(provider: str, customer_id: str):
 def oauth_callback_handler(code: str, state: str, error: str):
     if error:
         return JSONResponse({"connected": False, "error": error}, status_code=400)
-
     if not code or not state:
         return JSONResponse({"connected": False, "error": "Missing code/state"}, status_code=400)
 
@@ -1907,12 +1723,7 @@ def oauth_callback_handler(code: str, state: str, error: str):
     tok = exchange_code_for_tokens(provider, code)
     if tok["status"] != 200 or not tok["json"]:
         return JSONResponse(
-            {
-                "connected": False,
-                "provider": provider,
-                "error": "Token exchange failed",
-                "responseText": tok["text"],
-            },
+            {"connected": False, "provider": provider, "error": "Token exchange failed", "responseText": tok["text"]},
             status_code=500,
         )
 
@@ -1924,16 +1735,13 @@ def oauth_callback_handler(code: str, state: str, error: str):
 
     if not access_token or not refresh_token:
         return JSONResponse(
-            {
-                "connected": False,
-                "provider": provider,
-                "error": "Missing access_token or refresh_token",
-            },
+            {"connected": False, "provider": provider, "error": "Missing access_token or refresh_token"},
             status_code=500,
         )
 
     email = fetch_user_email(provider, access_token)
     save_oauth_token(provider, customer_id, email, refresh_token, scope, token_type)
+
     ensure_customer_settings(customer_id)
     sync_calendars_from_provider(provider, customer_id, access_token)
 
@@ -1951,9 +1759,11 @@ def oauth_callback_handler(code: str, state: str, error: str):
 def calendars_handler(provider: str, request: Request, customer_id: str):
     require_api_key(request)
     provider = validate_provider(provider)
+
     rt = load_refresh_token(provider, customer_id)
     access_token = refresh_access_token(provider, rt)
     sync_calendars_from_provider(provider, customer_id, access_token)
+
     return {
         "customerId": customer_id,
         "provider": provider,
@@ -1964,9 +1774,9 @@ def calendars_handler(provider: str, request: Request, customer_id: str):
 def calendars_select_handler(provider: str, request: Request, payload: Dict[str, Any]):
     require_api_key(request)
     provider = validate_provider(provider)
+
     customer_id = payload.get("customerId")
     calendar_ids = payload.get("calendarIds") or []
-
     if not customer_id:
         raise HTTPException(status_code=400, detail="customerId required")
     if not isinstance(calendar_ids, list) or not calendar_ids:
@@ -1977,16 +1787,13 @@ def calendars_select_handler(provider: str, request: Request, payload: Dict[str,
         "ok": True,
         "customerId": customer_id,
         "provider": provider,
-        "selected": selected_calendar_ids(
-            provider,
-            customer_id,
-            provider_default_calendar_id(provider),
-        ),
+        "selected": selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider)),
     }
 
 
 def settings_handler(request: Request, payload: Dict[str, Any]):
     require_api_key(request)
+
     customer_id = payload.get("customerId")
     if not customer_id:
         raise HTTPException(status_code=400, detail="customerId required")
@@ -2016,17 +1823,10 @@ def freebusy_handler(provider: str, request: Request, payload: Dict[str, Any]):
         time_min = parse_iso_to_utc(payload.get("timeMinUtc"))
         time_max = parse_iso_to_utc(payload.get("timeMaxUtc"))
     except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="timeMinUtc and timeMaxUtc required and must be ISO (Z or offset)",
-        )
+        raise HTTPException(status_code=400, detail="timeMinUtc and timeMaxUtc required and must be ISO (Z or offset)")
 
     cal_ids = payload.get("calendarIds")
-    calendar_ids = (
-        cal_ids
-        if isinstance(cal_ids, list) and cal_ids
-        else selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider))
-    )
+    calendar_ids = cal_ids if isinstance(cal_ids, list) and cal_ids else selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider))
     calendar_ids = [c for c in calendar_ids if c]
 
     if not calendar_ids:
@@ -2034,6 +1834,7 @@ def freebusy_handler(provider: str, request: Request, payload: Dict[str, Any]):
 
     rt = load_refresh_token(provider, customer_id)
     access_token = refresh_access_token(provider, rt)
+
     pack = collect_busy_utc(provider, access_token, tz_name, calendar_ids, time_min, time_max)
     pack["isFree"] = len(pack.get("busyMerged", [])) == 0
     pack["status"] = "free" if pack["isFree"] else "busy"
@@ -2053,7 +1854,6 @@ def check_availability_handler(provider: str, request: Request, payload: Dict[st
 
     start_raw = payload.get("startUtc") or payload.get("timeMinUtc")
     end_raw = payload.get("endUtc") or payload.get("timeMaxUtc")
-
     if not start_raw or not end_raw:
         raise HTTPException(status_code=400, detail="startUtc/endUtc required")
 
@@ -2061,22 +1861,14 @@ def check_availability_handler(provider: str, request: Request, payload: Dict[st
         start_utc = parse_iso_to_utc(start_raw)
         end_utc = parse_iso_to_utc(end_raw)
     except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="startUtc/endUtc must be ISO with Z or offset",
-        )
+        raise HTTPException(status_code=400, detail="startUtc/endUtc must be ISO with Z or offset")
 
     if end_utc <= start_utc:
         raise HTTPException(status_code=400, detail="endUtc must be after startUtc")
 
     cal_ids = payload.get("calendarIds")
-    calendar_ids = (
-        cal_ids
-        if isinstance(cal_ids, list) and cal_ids
-        else selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider))
-    )
+    calendar_ids = cal_ids if isinstance(cal_ids, list) and cal_ids else selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider))
     calendar_ids = [c for c in calendar_ids if c]
-
     if not calendar_ids:
         raise HTTPException(status_code=400, detail=f"No {provider} calendars selected/found")
 
@@ -2098,9 +1890,10 @@ def check_availability_handler(provider: str, request: Request, payload: Dict[st
         for bs, be in merged_busy
         if overlaps(start_utc, end_utc, bs, be)
     ]
-    is_free = len(overlaps_found) == 0
 
+    is_free = len(overlaps_found) == 0
     tz = zoneinfo_from_any_tz(tz_name, fallback="UTC")
+
     return {
         "ok": True,
         "provider": provider,
@@ -2144,18 +1937,14 @@ def availability_handler(provider: str, request: Request, payload: Dict[str, Any
     work_start = int(payload.get("workStartHour", settings["work_start_hour"]))
     work_end = int(payload.get("workEndHour", settings["work_end_hour"]))
     work_days = normalize_work_days(payload.get("workDays", settings["work_days"]))
+
     duration = int(payload.get("durationMinutes", 60))
     step = int(payload.get("stepMinutes", 30))
     days = int(payload.get("days", 7))
 
     cal_ids = payload.get("calendarIds")
-    calendar_ids = (
-        cal_ids
-        if isinstance(cal_ids, list) and cal_ids
-        else selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider))
-    )
+    calendar_ids = cal_ids if isinstance(cal_ids, list) and cal_ids else selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider))
     calendar_ids = [c for c in calendar_ids if c]
-
     if not calendar_ids:
         raise HTTPException(status_code=400, detail=f"No {provider} calendars selected/found")
 
@@ -2165,11 +1954,7 @@ def availability_handler(provider: str, request: Request, payload: Dict[str, Any
         try:
             preferred_utc = parse_iso_to_utc(preferred_raw)
         except Exception:
-            return {
-                "ok": False,
-                "reason": "invalid_preferredDateTimeUtc",
-                "message": "preferredDateTimeUtc must be ISO with Z or offset",
-            }
+            return {"ok": False, "reason": "invalid_preferredDateTimeUtc", "message": "preferredDateTimeUtc must be ISO with Z or offset"}
 
     preference = payload.get("preference")
     if preference is not None and not isinstance(preference, dict):
@@ -2186,14 +1971,7 @@ def availability_handler(provider: str, request: Request, payload: Dict[str, Any
     time_min_utc = now_local.astimezone(timezone.utc)
     time_max_utc = horizon_end_local.astimezone(timezone.utc)
 
-    busy_pack = collect_busy_utc(
-        provider,
-        access_token,
-        tz_name,
-        calendar_ids,
-        time_min_utc,
-        time_max_utc,
-    )
+    busy_pack = collect_busy_utc(provider, access_token, tz_name, calendar_ids, time_min_utc, time_max_utc)
     merged_busy = [
         (parse_iso_to_utc(x["startUtc"]), parse_iso_to_utc(x["endUtc"]))
         for x in busy_pack.get("busyMerged", [])
@@ -2235,10 +2013,7 @@ def create_event_handler(provider: str, request: Request, payload: Dict[str, Any
         sel = selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider))
         sel = [c for c in sel if c]
         if not sel:
-            raise HTTPException(
-                status_code=400,
-                detail=f"No {provider} calendarId provided and none selected",
-            )
+            raise HTTPException(status_code=400, detail=f"No {provider} calendarId provided and none selected")
         calendar_id = sel[0]
 
     summary = (payload.get("summary") or "").strip() or "Appointment"
@@ -2260,19 +2035,12 @@ def create_event_handler(provider: str, request: Request, payload: Dict[str, Any
         return {
             "booked": False,
             "reason": "invalid_datetime",
-            "message": (
-                "start.dateTime and end.dateTime must be valid ISO datetimes "
-                "(Z/offset) or naive ISO assumed in timeZone"
-            ),
+            "message": "start.dateTime and end.dateTime must be valid ISO datetimes (Z/offset) or naive ISO assumed in timeZone",
             "error": repr(e),
         }
 
     if end_utc <= start_utc:
-        return {
-            "booked": False,
-            "reason": "invalid_range",
-            "message": "end must be after start",
-        }
+        return {"booked": False, "reason": "invalid_range", "message": "end must be after start"}
 
     rt = load_refresh_token(provider, customer_id)
     access_token = refresh_access_token(provider, rt)
@@ -2285,14 +2053,7 @@ def create_event_handler(provider: str, request: Request, payload: Dict[str, Any
     time_min = start_utc - timedelta(minutes=1)
     time_max = end_utc + timedelta(minutes=1)
 
-    busy_pack = collect_busy_utc(
-        provider,
-        access_token,
-        tz_name,
-        calendars_to_check,
-        time_min,
-        time_max,
-    )
+    busy_pack = collect_busy_utc(provider, access_token, tz_name, calendars_to_check, time_min, time_max)
     merged_busy = [
         (parse_iso_to_utc(x["startUtc"]), parse_iso_to_utc(x["endUtc"]))
         for x in busy_pack.get("busyMerged", [])
@@ -2320,7 +2081,6 @@ def create_event_handler(provider: str, request: Request, payload: Dict[str, Any
         tz_name=tz_name,
         attendees=attendees,
     )
-
     if created["statusCode"] not in (200, 201):
         return {
             "booked": False,
@@ -2353,18 +2113,13 @@ def search_events_handler(provider: str, request: Request, payload: Dict[str, An
     tz_name = payload.get("timeZone") or settings["timezone"]
 
     cal_ids = payload.get("calendarIds")
-    calendar_ids = (
-        cal_ids
-        if isinstance(cal_ids, list) and cal_ids
-        else selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider))
-    )
+    calendar_ids = cal_ids if isinstance(cal_ids, list) and cal_ids else selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider))
     calendar_ids = [c for c in calendar_ids if c]
     if not calendar_ids:
         raise HTTPException(status_code=400, detail=f"No {provider} calendars selected/found")
 
     email = (payload.get("email") or "").strip().lower()
     phone_digits = digits_only((payload.get("phone") or "").strip())
-
     if not email and not phone_digits:
         raise HTTPException(status_code=400, detail="Provide email and/or phone")
 
@@ -2380,10 +2135,7 @@ def search_events_handler(provider: str, request: Request, payload: Dict[str, An
         time_min = parse_iso_to_utc(payload.get("timeMinUtc")) if payload.get("timeMinUtc") else default_min
         time_max = parse_iso_to_utc(payload.get("timeMaxUtc")) if payload.get("timeMaxUtc") else default_max
     except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="timeMinUtc/timeMaxUtc must be ISO with Z or offset",
-        )
+        raise HTTPException(status_code=400, detail="timeMinUtc/timeMaxUtc must be ISO with Z or offset")
 
     time_min -= timedelta(minutes=1)
     time_max += timedelta(minutes=1)
@@ -2427,32 +2179,20 @@ def cancel_events_handler(provider: str, request: Request, payload: Dict[str, An
 
         cal_id = (it.get("calendarId") or "").strip()
         ev_id = (it.get("eventId") or "").strip()
-
         if not ev_id:
             continue
+
         if provider == PROVIDER_GOOGLE and not cal_id:
             continue
 
         r = provider_delete_event(provider, access_token, cal_id, ev_id)
         ok = r["statusCode"] in (200, 202, 204)
-
-        row = {
-            "eventId": ev_id,
-            "cancelled": ok,
-            "statusCode": r["statusCode"],
-            "providerText": r["text"],
-        }
+        row = {"eventId": ev_id, "cancelled": ok, "statusCode": r["statusCode"], "providerText": r["text"]}
         if cal_id:
             row["calendarId"] = cal_id
         results.append(row)
 
-    return {
-        "ok": True,
-        "provider": provider,
-        "requested": len(items),
-        "processed": len(results),
-        "results": results,
-    }
+    return {"ok": True, "provider": provider, "requested": len(items), "processed": len(results), "results": results}
 
 
 def reschedule_events_handler(provider: str, request: Request, payload: Dict[str, Any]):
@@ -2485,7 +2225,6 @@ def reschedule_events_handler(provider: str, request: Request, payload: Dict[str
 
         cal_id = (it.get("calendarId") or "").strip()
         ev_id = (it.get("eventId") or "").strip()
-
         if not ev_id:
             continue
         if provider == PROVIDER_GOOGLE and not cal_id:
@@ -2502,24 +2241,11 @@ def reschedule_events_handler(provider: str, request: Request, payload: Dict[str
             new_start = parse_any_datetime_to_utc(raw_start, tz_name)
             new_end = parse_any_datetime_to_utc(raw_end, tz_name)
         except Exception as e:
-            results.append(
-                {
-                    "eventId": ev_id,
-                    "rescheduled": False,
-                    "reason": "invalid_datetime",
-                    "error": repr(e),
-                }
-            )
+            results.append({"eventId": ev_id, "rescheduled": False, "reason": "invalid_datetime", "error": repr(e)})
             continue
 
         if new_end <= new_start:
-            results.append(
-                {
-                    "eventId": ev_id,
-                    "rescheduled": False,
-                    "reason": "invalid_range",
-                }
-            )
+            results.append({"eventId": ev_id, "rescheduled": False, "reason": "invalid_range"})
             continue
 
         time_min = new_start - timedelta(minutes=1)
@@ -2528,9 +2254,7 @@ def reschedule_events_handler(provider: str, request: Request, payload: Dict[str
         busy_merged = collect_busy_utc_excluding_event(
             provider=provider,
             access_token=access_token,
-            calendar_ids=([cal_id] + calendars_to_check)
-            if (provider == PROVIDER_GOOGLE and cal_id and cal_id not in calendars_to_check)
-            else calendars_to_check,
+            calendar_ids=([cal_id] + calendars_to_check) if (provider == PROVIDER_GOOGLE and cal_id and cal_id not in calendars_to_check) else calendars_to_check,
             time_min_utc=time_min,
             time_max_utc=time_max,
             exclude_calendar_id=cal_id if provider == PROVIDER_GOOGLE else None,
@@ -2540,14 +2264,7 @@ def reschedule_events_handler(provider: str, request: Request, payload: Dict[str
 
         taken = any(overlaps(new_start, new_end, bs, be) for bs, be in busy_merged)
         if taken:
-            results.append(
-                {
-                    "eventId": ev_id,
-                    "rescheduled": False,
-                    "reason": "slot_taken",
-                    "message": "That time is already booked. Please pick another slot.",
-                }
-            )
+            results.append({"eventId": ev_id, "rescheduled": False, "reason": "slot_taken", "message": "That time is already booked. Please pick another slot."})
             continue
 
         patched = provider_patch_event_time(
@@ -2559,7 +2276,6 @@ def reschedule_events_handler(provider: str, request: Request, payload: Dict[str
             end_utc=new_end,
             tz_name=tz_name,
         )
-
         ok = patched["statusCode"] in (200,)
         row = {
             "eventId": ev_id,
@@ -2572,13 +2288,7 @@ def reschedule_events_handler(provider: str, request: Request, payload: Dict[str
             row["calendarId"] = cal_id
         results.append(row)
 
-    return {
-        "ok": True,
-        "provider": provider,
-        "requested": len(items),
-        "processed": len(results),
-        "results": results,
-    }
+    return {"ok": True, "provider": provider, "requested": len(items), "processed": len(results), "results": results}
 
 
 # =============================================================================
@@ -2601,35 +2311,28 @@ def debug_db(request: Request):
 def debug_schema(request: Request):
     require_debug_key(request)
     out: Dict[str, Any] = {"tables": []}
-
     with engine.begin() as conn:
         tables = conn.execute(
-            text(
-                """
+            text("""
                 SELECT table_name
                 FROM information_schema.tables
                 WHERE table_schema='public'
                 ORDER BY table_name
-                """
-            )
+            """)
         ).fetchall()
-
         out["tables"] = [t[0] for t in tables]
 
         for tname in out["tables"]:
             cols = conn.execute(
-                text(
-                    """
+                text("""
                     SELECT column_name AS name, data_type AS type
                     FROM information_schema.columns
                     WHERE table_schema='public' AND table_name=:t
                     ORDER BY ordinal_position
-                    """
-                ),
+                """),
                 {"t": tname},
             ).fetchall()
             out[tname] = [{"name": c[0], "type": c[1]} for c in cols]
-
     return out
 
 
@@ -2643,7 +2346,7 @@ def oauth_start(provider: str, customerId: str = Query(...)):
 
 @app.get("/oauth/{provider}/callback")
 def oauth_callback(provider: str, code: str = "", state: str = "", error: str = ""):
-    validate_provider(provider)
+    provider = validate_provider(provider)
     return oauth_callback_handler(code, state, error)
 
 
