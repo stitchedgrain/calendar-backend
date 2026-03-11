@@ -18,7 +18,7 @@ from sqlalchemy.engine import Engine
 # =============================================================================
 # App
 # =============================================================================
-app = FastAPI(title="Calendar Backend", version="3.5.0")
+app = FastAPI(title="Calendar Backend", version="3.6.0")
 
 # =============================================================================
 # Env
@@ -1249,7 +1249,6 @@ def microsoft_collect_busy_utc(
 
             show_as = str(ev.get("showAs") or "").strip().lower()
 
-            # only explicit free is ignored
             if show_as == "free":
                 continue
 
@@ -1851,6 +1850,9 @@ def check_availability_handler(provider: str, request: Request, payload: Dict[st
 
     settings = ensure_customer_settings(customer_id)
     tz_name = payload.get("timeZone") or settings["timezone"]
+    work_start = int(payload.get("workStartHour", settings["work_start_hour"]))
+    work_end = int(payload.get("workEndHour", settings["work_end_hour"]))
+    work_days = normalize_work_days(payload.get("workDays", settings["work_days"]))
 
     start_raw = payload.get("startUtc") or payload.get("timeMinUtc")
     end_raw = payload.get("endUtc") or payload.get("timeMaxUtc")
@@ -1866,8 +1868,16 @@ def check_availability_handler(provider: str, request: Request, payload: Dict[st
     if end_utc <= start_utc:
         raise HTTPException(status_code=400, detail="endUtc must be after startUtc")
 
+    duration_minutes = int(payload.get("durationMinutes", max(1, int((end_utc - start_utc).total_seconds() // 60))))
+    step_minutes = int(payload.get("stepMinutes", 30))
+    days = int(payload.get("days", 7))
+
     cal_ids = payload.get("calendarIds")
-    calendar_ids = cal_ids if isinstance(cal_ids, list) and cal_ids else selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider))
+    calendar_ids = cal_ids if isinstance(cal_ids, list) and cal_ids else selected_calendar_ids(
+        provider,
+        customer_id,
+        provider_default_calendar_id(provider),
+    )
     calendar_ids = [c for c in calendar_ids if c]
     if not calendar_ids:
         raise HTTPException(status_code=400, detail=f"No {provider} calendars selected/found")
@@ -1875,10 +1885,10 @@ def check_availability_handler(provider: str, request: Request, payload: Dict[st
     rt = load_refresh_token(provider, customer_id)
     access_token = refresh_access_token(provider, rt)
 
-    time_min = start_utc - timedelta(minutes=1)
-    time_max = end_utc + timedelta(minutes=1)
+    exact_min = start_utc - timedelta(minutes=1)
+    exact_max = end_utc + timedelta(minutes=1)
 
-    busy_pack = collect_busy_utc(provider, access_token, tz_name, calendar_ids, time_min, time_max)
+    busy_pack = collect_busy_utc(provider, access_token, tz_name, calendar_ids, exact_min, exact_max)
     merged_busy = [
         (parse_iso_to_utc(x["startUtc"]), parse_iso_to_utc(x["endUtc"]))
         for x in busy_pack.get("busyMerged", [])
@@ -1894,6 +1904,62 @@ def check_availability_handler(provider: str, request: Request, payload: Dict[st
     is_free = len(overlaps_found) == 0
     tz = zoneinfo_from_any_tz(tz_name, fallback="UTC")
 
+    preference = payload.get("preference")
+    if preference is not None and not isinstance(preference, dict):
+        preference = None
+
+    preferred_utc = start_utc
+
+    now_local = datetime.now(tz).replace(second=0, microsecond=0)
+    start_day = now_local.date()
+    end_day = start_day + timedelta(days=max(1, days))
+    horizon_end_local = datetime(end_day.year, end_day.month, end_day.day, work_end, 0, tzinfo=tz)
+    horizon_min_utc = now_local.astimezone(timezone.utc)
+    horizon_max_utc = horizon_end_local.astimezone(timezone.utc)
+
+    horizon_busy_pack = collect_busy_utc(provider, access_token, tz_name, calendar_ids, horizon_min_utc, horizon_max_utc)
+    horizon_merged_busy = [
+        (parse_iso_to_utc(x["startUtc"]), parse_iso_to_utc(x["endUtc"]))
+        for x in horizon_busy_pack.get("busyMerged", [])
+    ]
+    horizon_merged_busy = merge_intervals_dt(horizon_merged_busy)
+
+    availability_out = compute_availability_from_busy(
+        tz_name=tz_name,
+        work_start_hour=work_start,
+        work_end_hour=work_end,
+        work_days=work_days,
+        merged_busy=horizon_merged_busy,
+        duration_minutes=duration_minutes,
+        step_minutes=step_minutes,
+        days=days,
+        preferred_utc=preferred_utc,
+        preference=preference,
+    )
+
+    if is_free:
+        return {
+            "ok": True,
+            "provider": provider,
+            "customerId": customer_id,
+            "timeZone": tz_name,
+            "startUtc": iso_z(start_utc),
+            "endUtc": iso_z(end_utc),
+            "startLocal": format_local(start_utc, tz),
+            "endLocal": format_local(end_utc, tz),
+            "calendarIdsUsed": calendar_ids,
+            "isFree": True,
+            "status": "free",
+            "reason": "slot_free",
+            "message": "That time is free.",
+            "busyMerged": horizon_busy_pack.get("busyMerged", []),
+            "overlaps": [],
+            "suggestions": availability_out.get("suggestions", []),
+            "availableCount": availability_out.get("availableCount", 0),
+            "available": availability_out.get("available", []),
+            "debug": horizon_busy_pack.get("debug"),
+        }
+
     return {
         "ok": True,
         "provider": provider,
@@ -1904,11 +1970,16 @@ def check_availability_handler(provider: str, request: Request, payload: Dict[st
         "startLocal": format_local(start_utc, tz),
         "endLocal": format_local(end_utc, tz),
         "calendarIdsUsed": calendar_ids,
-        "isFree": is_free,
-        "status": "free" if is_free else "busy",
-        "busyMerged": busy_pack.get("busyMerged", []),
+        "isFree": False,
+        "status": "busy",
+        "reason": "slot_taken",
+        "message": "Sorry, someone just booked that slot. Please pick another time.",
+        "busyMerged": horizon_busy_pack.get("busyMerged", []),
         "overlaps": overlaps_found,
-        "debug": busy_pack.get("debug"),
+        "suggestions": availability_out.get("suggestions", []),
+        "availableCount": availability_out.get("availableCount", 0),
+        "available": availability_out.get("available", []),
+        "debug": horizon_busy_pack.get("debug"),
     }
 
 
@@ -1943,7 +2014,11 @@ def availability_handler(provider: str, request: Request, payload: Dict[str, Any
     days = int(payload.get("days", 7))
 
     cal_ids = payload.get("calendarIds")
-    calendar_ids = cal_ids if isinstance(cal_ids, list) and cal_ids else selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider))
+    calendar_ids = cal_ids if isinstance(cal_ids, list) and cal_ids else selected_calendar_ids(
+        provider,
+        customer_id,
+        provider_default_calendar_id(provider),
+    )
     calendar_ids = [c for c in calendar_ids if c]
     if not calendar_ids:
         raise HTTPException(status_code=400, detail=f"No {provider} calendars selected/found")
@@ -1954,7 +2029,11 @@ def availability_handler(provider: str, request: Request, payload: Dict[str, Any
         try:
             preferred_utc = parse_iso_to_utc(preferred_raw)
         except Exception:
-            return {"ok": False, "reason": "invalid_preferredDateTimeUtc", "message": "preferredDateTimeUtc must be ISO with Z or offset"}
+            return {
+                "ok": False,
+                "reason": "invalid_preferredDateTimeUtc",
+                "message": "preferredDateTimeUtc must be ISO with Z or offset",
+            }
 
     preference = payload.get("preference")
     if preference is not None and not isinstance(preference, dict):
@@ -1994,6 +2073,7 @@ def availability_handler(provider: str, request: Request, payload: Dict[str, Any
     out["calendarIdsUsed"] = calendar_ids
     out["busyMerged"] = busy_pack.get("busyMerged", [])
     out["debug"] = busy_pack.get("debug")
+    out["message"] = "Available times found." if out.get("availableCount", 0) > 0 else "No available times found in the requested window."
     return out
 
 
