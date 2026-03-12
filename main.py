@@ -1,11 +1,14 @@
+
 from __future__ import annotations
 
+import calendar as pycalendar
 import json
 import os
 import re
 import secrets
 import urllib.parse
-from datetime import datetime, timedelta, timezone
+import uuid
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -15,10 +18,9 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-# =============================================================================
-# App
-# =============================================================================
-app = FastAPI(title="Calendar Backend", version="3.6.0")
+
+app = FastAPI(title="Calendar Backend", version="4.1.0")
+
 
 # =============================================================================
 # Env
@@ -39,12 +41,14 @@ MS_CLIENT_SECRET = (os.environ.get("MS_CLIENT_SECRET") or "").strip()
 MS_REDIRECT_URI = (os.environ.get("MS_REDIRECT_URI") or "").strip()
 MS_TENANT = (os.environ.get("MS_TENANT") or "common").strip()
 
+
 # =============================================================================
 # Provider constants
 # =============================================================================
 PROVIDER_GOOGLE = "google"
 PROVIDER_MICROSOFT = "microsoft"
 SUPPORTED_PROVIDERS = {PROVIDER_GOOGLE, PROVIDER_MICROSOFT}
+
 
 # =============================================================================
 # Google constants
@@ -63,6 +67,7 @@ GOOGLE_SCOPES = [
     "email",
     "profile",
 ]
+
 
 # =============================================================================
 # Microsoft constants
@@ -86,7 +91,10 @@ MS_SCOPES = [
     "https://graph.microsoft.com/Calendars.ReadWrite",
 ]
 
-# Windows -> IANA mapping for common Graph timezone names
+
+# =============================================================================
+# Windows -> IANA mapping
+# =============================================================================
 WINDOWS_TZ_TO_IANA: Dict[str, str] = {
     "UTC": "UTC",
     "Mountain Standard Time": "America/Denver",
@@ -124,6 +132,7 @@ WINDOWS_TZ_TO_IANA: Dict[str, str] = {
     "New Zealand Standard Time": "Pacific/Auckland",
 }
 
+
 # =============================================================================
 # API key helpers
 # =============================================================================
@@ -150,9 +159,7 @@ def normalize_tz_name_for_zoneinfo(tz_name: str, fallback: str = "UTC") -> str:
     raw = (tz_name or "").strip()
     if not raw:
         return fallback
-    if raw in WINDOWS_TZ_TO_IANA:
-        return WINDOWS_TZ_TO_IANA[raw]
-    return raw
+    return WINDOWS_TZ_TO_IANA.get(raw, raw)
 
 
 def zoneinfo_from_any_tz(tz_name: str, fallback: str = "UTC") -> ZoneInfo:
@@ -160,10 +167,7 @@ def zoneinfo_from_any_tz(tz_name: str, fallback: str = "UTC") -> ZoneInfo:
     try:
         return ZoneInfo(norm)
     except Exception:
-        try:
-            return ZoneInfo(fallback)
-        except Exception:
-            return ZoneInfo("UTC")
+        return ZoneInfo(fallback)
 
 
 # =============================================================================
@@ -232,6 +236,33 @@ def init_db() -> None:
       work_days       TEXT NOT NULL DEFAULT '[0,1,2,3,4]',
       created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS customer_blackout_dates (
+      customer_id TEXT NOT NULL,
+      date_value  DATE NOT NULL,
+      label       TEXT,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (customer_id, date_value)
+    );
+
+    CREATE TABLE IF NOT EXISTS customer_holiday_calendars (
+      customer_id   TEXT NOT NULL,
+      calendar_name TEXT NOT NULL,
+      config_json   TEXT NOT NULL,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (customer_id, calendar_name)
+    );
+
+    CREATE TABLE IF NOT EXISTS slot_holds (
+      hold_token  TEXT PRIMARY KEY,
+      provider    TEXT NOT NULL,
+      customer_id TEXT NOT NULL,
+      calendar_id TEXT,
+      start_utc   TIMESTAMPTZ NOT NULL,
+      end_utc     TIMESTAMPTZ NOT NULL,
+      expires_at  TIMESTAMPTZ NOT NULL,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
     """
     with engine.begin() as conn:
         conn.execute(text(ddl))
@@ -250,8 +281,9 @@ def init_db() -> None:
 
 init_db()
 
+
 # =============================================================================
-# Helpers
+# General helpers
 # =============================================================================
 def validate_provider(provider: str) -> str:
     p = (provider or "").strip().lower()
@@ -459,6 +491,100 @@ def pick_by_preference(
 
 
 # =============================================================================
+# Holiday helpers
+# =============================================================================
+WEEKDAY_NAME_TO_INT = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+
+def nth_weekday_of_month(year: int, month: int, weekday: int, nth: int) -> Optional[date]:
+    if nth < 1:
+        return None
+    first_weekday, days_in_month = pycalendar.monthrange(year, month)
+    offset = (weekday - first_weekday) % 7
+    day_num = 1 + offset + (nth - 1) * 7
+    if day_num > days_in_month:
+        return None
+    return date(year, month, day_num)
+
+
+def validate_holiday_rule(rule: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(rule, dict):
+        raise HTTPException(status_code=400, detail="Each holiday rule must be an object")
+
+    name = (rule.get("name") or "").strip()
+    rule_type = (rule.get("type") or "").strip().lower()
+    if not name:
+        raise HTTPException(status_code=400, detail="Holiday rule name is required")
+    if rule_type not in ("fixed", "nth_weekday"):
+        raise HTTPException(status_code=400, detail="Holiday rule type must be fixed or nth_weekday")
+
+    month = int(rule.get("month"))
+    if not (1 <= month <= 12):
+        raise HTTPException(status_code=400, detail="Holiday month must be 1-12")
+
+    out: Dict[str, Any] = {"name": name, "type": rule_type, "month": month}
+
+    if rule_type == "fixed":
+        day = int(rule.get("day"))
+        if not (1 <= day <= 31):
+            raise HTTPException(status_code=400, detail="Holiday day must be 1-31")
+        out["day"] = day
+
+    if rule_type == "nth_weekday":
+        weekday_name = (rule.get("weekday") or "").strip().lower()
+        if weekday_name not in WEEKDAY_NAME_TO_INT:
+            raise HTTPException(status_code=400, detail="Holiday weekday is invalid")
+        nth = int(rule.get("nth"))
+        if not (1 <= nth <= 5):
+            raise HTTPException(status_code=400, detail="Holiday nth must be 1-5")
+        out["weekday"] = weekday_name
+        out["nth"] = nth
+
+    return out
+
+
+def validate_holiday_calendar_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    calendars = payload.get("calendars")
+    if not isinstance(calendars, list):
+        raise HTTPException(status_code=400, detail="calendars must be a list")
+
+    normalized = {"calendars": []}
+    for cal in calendars:
+        if not isinstance(cal, dict):
+            continue
+        calendar_name = (cal.get("calendar") or "").strip()
+        holidays = cal.get("holidays") or []
+        if not calendar_name:
+            raise HTTPException(status_code=400, detail="calendar name is required")
+        if not isinstance(holidays, list):
+            raise HTTPException(status_code=400, detail="holidays must be a list")
+
+        normalized_rules = [validate_holiday_rule(rule) for rule in holidays]
+        normalized["calendars"].append({
+            "calendar": calendar_name,
+            "holidays": normalized_rules,
+        })
+
+    return normalized
+
+
+def nth_years_to_cover(*years: int) -> List[int]:
+    s = {y for y in years if isinstance(y, int)}
+    if not s:
+        now_y = datetime.now().year
+        s = {now_y, now_y + 1}
+    return sorted(s)
+
+
+# =============================================================================
 # DB accessors
 # =============================================================================
 def upsert_oauth_state(state: str, customer_id: str, provider: str) -> None:
@@ -568,10 +694,7 @@ def update_customer_settings(
     work_end: int,
     work_days: List[int],
 ) -> Dict[str, Any]:
-    try:
-        zoneinfo_from_any_tz(tz_name, fallback="UTC")
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid timeZone")
+    zoneinfo_from_any_tz(tz_name, fallback="UTC")
 
     if not (0 <= work_start <= 23 and 1 <= work_end <= 24 and work_end > work_start):
         raise HTTPException(status_code=400, detail="Invalid working hours")
@@ -593,6 +716,61 @@ def update_customer_settings(
             {"cid": customer_id, "tz": tz_name, "ws": work_start, "we": work_end, "wd": json.dumps(work_days)},
         )
     return ensure_customer_settings(customer_id)
+
+
+def replace_customer_calendars(provider: str, customer_id: str, calendars: List[Dict[str, Any]]) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                DELETE FROM customer_calendars
+                WHERE provider=:p AND customer_id=:cid
+            """),
+            {"p": provider, "cid": customer_id},
+        )
+
+        q = text("""
+            INSERT INTO customer_calendars(provider, customer_id, calendar_id, summary, primary_cal, selected)
+            VALUES (:p, :cid, :calid, :summary, :primary, :selected)
+        """)
+
+        inserted_primary = False
+        first_id: Optional[str] = None
+
+        for c in calendars:
+            calid = c.get("id")
+            if not calid:
+                continue
+
+            if first_id is None:
+                first_id = calid
+
+            primary = bool(c.get("primary", False))
+            selected = primary
+
+            if primary:
+                inserted_primary = True
+
+            conn.execute(
+                q,
+                {
+                    "p": provider,
+                    "cid": customer_id,
+                    "calid": calid,
+                    "summary": c.get("summary"),
+                    "primary": primary,
+                    "selected": selected,
+                },
+            )
+
+        if calendars and not inserted_primary and first_id:
+            conn.execute(
+                text("""
+                    UPDATE customer_calendars
+                    SET selected=true
+                    WHERE provider=:p AND customer_id=:cid AND calendar_id=:calid
+                """),
+                {"p": provider, "cid": customer_id, "calid": first_id},
+            )
 
 
 def list_calendars_db(provider: str, customer_id: str) -> List[Dict[str, Any]]:
@@ -666,59 +844,271 @@ def selected_calendar_ids(provider: str, customer_id: str, default_fallback: Opt
     return [default_fallback] if default_fallback else []
 
 
-def replace_customer_calendars(provider: str, customer_id: str, calendars: List[Dict[str, Any]]) -> None:
+# =============================================================================
+# Blackout date helpers
+# =============================================================================
+def normalize_date_str(raw: str) -> str:
+    s = (raw or "").strip()
+    if not s:
+        raise HTTPException(status_code=400, detail="date is required")
+    try:
+        d = datetime.strptime(s, "%Y-%m-%d").date()
+        return d.isoformat()
+    except Exception:
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+
+
+def list_blackout_dates(customer_id: str) -> List[Dict[str, Any]]:
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT date_value::text, label
+                FROM customer_blackout_dates
+                WHERE customer_id=:cid
+                ORDER BY date_value
+            """),
+            {"cid": customer_id},
+        ).fetchall()
+
+    return [{"date": r[0], "label": r[1] or ""} for r in rows]
+
+
+def blackout_date_set(customer_id: str) -> set[str]:
+    return {x["date"] for x in list_blackout_dates(customer_id)}
+
+
+def upsert_blackout_dates(customer_id: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not isinstance(items, list):
+        raise HTTPException(status_code=400, detail="items must be a list")
+
+    with engine.begin() as conn:
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            date_value = normalize_date_str(it.get("date") or "")
+            label = (it.get("label") or "").strip()
+            conn.execute(
+                text("""
+                    INSERT INTO customer_blackout_dates(customer_id, date_value, label)
+                    VALUES (:cid, :dv, :label)
+                    ON CONFLICT (customer_id, date_value) DO UPDATE SET
+                      label = EXCLUDED.label
+                """),
+                {"cid": customer_id, "dv": date_value, "label": label},
+            )
+
+    return list_blackout_dates(customer_id)
+
+
+def delete_blackout_dates(customer_id: str, dates: List[str]) -> List[Dict[str, Any]]:
+    if not isinstance(dates, list):
+        raise HTTPException(status_code=400, detail="dates must be a list")
+
+    cleaned = [normalize_date_str(x) for x in dates if (x or "").strip()]
+    if not cleaned:
+        return list_blackout_dates(customer_id)
+
     with engine.begin() as conn:
         conn.execute(
             text("""
-                DELETE FROM customer_calendars
-                WHERE provider=:p AND customer_id=:cid
+                DELETE FROM customer_blackout_dates
+                WHERE customer_id=:cid AND date_value = ANY(:dates)
             """),
-            {"p": provider, "cid": customer_id},
+            {"cid": customer_id, "dates": cleaned},
         )
 
-        q = text("""
-            INSERT INTO customer_calendars(provider, customer_id, calendar_id, summary, primary_cal, selected)
-            VALUES (:p, :cid, :calid, :summary, :primary, :selected)
-        """)
+    return list_blackout_dates(customer_id)
 
-        inserted_primary = False
-        first_id: Optional[str] = None
 
-        for c in calendars:
-            calid = c.get("id")
-            if not calid:
-                continue
+# =============================================================================
+# Holiday calendar helpers
+# =============================================================================
+def save_holiday_calendars(customer_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = validate_holiday_calendar_payload(payload)
+    calendars = normalized["calendars"]
 
-            if first_id is None:
-                first_id = calid
-
-            primary = bool(c.get("primary", False))
-            selected = primary
-
-            if primary:
-                inserted_primary = True
-
+    with engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM customer_holiday_calendars WHERE customer_id=:cid"),
+            {"cid": customer_id},
+        )
+        for cal in calendars:
             conn.execute(
-                q,
+                text("""
+                    INSERT INTO customer_holiday_calendars(customer_id, calendar_name, config_json)
+                    VALUES (:cid, :cname, :cfg)
+                """),
                 {
-                    "p": provider,
                     "cid": customer_id,
-                    "calid": calid,
-                    "summary": c.get("summary"),
-                    "primary": primary,
-                    "selected": selected,
+                    "cname": cal["calendar"],
+                    "cfg": json.dumps(cal),
                 },
             )
 
-        if calendars and not inserted_primary and first_id:
-            conn.execute(
-                text("""
-                    UPDATE customer_calendars
-                    SET selected=true
-                    WHERE provider=:p AND customer_id=:cid AND calendar_id=:calid
-                """),
-                {"p": provider, "cid": customer_id, "calid": first_id},
-            )
+    return load_holiday_calendars(customer_id)
+
+
+def load_holiday_calendars(customer_id: str) -> Dict[str, Any]:
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT config_json
+                FROM customer_holiday_calendars
+                WHERE customer_id=:cid
+                ORDER BY calendar_name
+            """),
+            {"cid": customer_id},
+        ).fetchall()
+
+    calendars = []
+    for row in rows:
+        try:
+            obj = json.loads(row[0])
+            if isinstance(obj, dict):
+                calendars.append(obj)
+        except Exception:
+            continue
+
+    return {"calendars": calendars}
+
+
+def expand_holiday_rules_for_year(rule: Dict[str, Any], year: int) -> List[str]:
+    out: List[str] = []
+    rule_type = rule["type"]
+    month = int(rule["month"])
+
+    if rule_type == "fixed":
+        day = int(rule["day"])
+        try:
+            d = date(year, month, day)
+            out.append(d.isoformat())
+        except Exception:
+            pass
+
+    elif rule_type == "nth_weekday":
+        weekday = WEEKDAY_NAME_TO_INT[rule["weekday"]]
+        nth = int(rule["nth"])
+        d = nth_weekday_of_month(year, month, weekday, nth)
+        if d:
+            out.append(d.isoformat())
+
+    return out
+
+
+def holiday_date_set(customer_id: str, years: List[int]) -> set[str]:
+    cfg = load_holiday_calendars(customer_id)
+    out: set[str] = set()
+
+    for cal in cfg.get("calendars", []):
+        for rule in cal.get("holidays", []):
+            for yr in years:
+                out.update(expand_holiday_rules_for_year(rule, yr))
+
+    return out
+
+
+def combined_closed_date_set(customer_id: str, years: List[int]) -> set[str]:
+    return blackout_date_set(customer_id) | holiday_date_set(customer_id, years)
+
+
+# =============================================================================
+# Slot hold helpers
+# =============================================================================
+def cleanup_expired_holds() -> None:
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM slot_holds WHERE expires_at <= NOW()"))
+
+
+def list_active_holds(
+    provider: str,
+    customer_id: str,
+    time_min_utc: datetime,
+    time_max_utc: datetime,
+    exclude_hold_token: Optional[str] = None,
+) -> List[Tuple[datetime, datetime]]:
+    cleanup_expired_holds()
+
+    q = """
+        SELECT start_utc, end_utc
+        FROM slot_holds
+        WHERE provider=:p
+          AND customer_id=:cid
+          AND expires_at > NOW()
+          AND end_utc > :tmin
+          AND start_utc < :tmax
+    """
+    params: Dict[str, Any] = {
+        "p": provider,
+        "cid": customer_id,
+        "tmin": time_min_utc,
+        "tmax": time_max_utc,
+    }
+
+    if exclude_hold_token:
+        q += " AND hold_token <> :ht"
+        params["ht"] = exclude_hold_token
+
+    with engine.begin() as conn:
+        rows = conn.execute(text(q), params).fetchall()
+
+    return [(r[0].astimezone(timezone.utc), r[1].astimezone(timezone.utc)) for r in rows]
+
+
+def create_slot_hold(
+    provider: str,
+    customer_id: str,
+    calendar_id: str,
+    start_utc: datetime,
+    end_utc: datetime,
+    ttl_seconds: int = 300,
+) -> Dict[str, Any]:
+    cleanup_expired_holds()
+
+    hold_token = str(uuid.uuid4())
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=max(30, int(ttl_seconds)))
+
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO slot_holds(
+                    hold_token, provider, customer_id, calendar_id,
+                    start_utc, end_utc, expires_at
+                )
+                VALUES (
+                    :ht, :p, :cid, :calid,
+                    :s, :e, :exp
+                )
+            """),
+            {
+                "ht": hold_token,
+                "p": provider,
+                "cid": customer_id,
+                "calid": calendar_id,
+                "s": start_utc,
+                "e": end_utc,
+                "exp": expires_at,
+            },
+        )
+
+    return {
+        "holdToken": hold_token,
+        "provider": provider,
+        "customerId": customer_id,
+        "calendarId": calendar_id,
+        "startUtc": iso_z(start_utc),
+        "endUtc": iso_z(end_utc),
+        "expiresAtUtc": iso_z(expires_at),
+    }
+
+
+def release_slot_hold(hold_token: str) -> bool:
+    cleanup_expired_holds()
+    with engine.begin() as conn:
+        result = conn.execute(
+            text("DELETE FROM slot_holds WHERE hold_token=:ht"),
+            {"ht": hold_token},
+        )
+    return bool(result.rowcount)
 
 
 # =============================================================================
@@ -1064,11 +1454,7 @@ def microsoft_calendar_view_api(
     next_link: Optional[str] = None,
 ) -> Dict[str, Any]:
     if next_link:
-        r = requests.get(
-            next_link,
-            headers=_graph_headers(access_token),
-            timeout=30,
-        )
+        r = requests.get(next_link, headers=_graph_headers(access_token), timeout=30)
         return {"statusCode": r.status_code, "json": safe_json(r), "text": r.text}
 
     url = MS_CALENDARVIEW_URL.format(calendarId=safe_cal_id(calendar_id))
@@ -1234,12 +1620,7 @@ def microsoft_collect_busy_utc(
     calendar_view_busy_count = 0
 
     for cid in calendar_ids:
-        items = microsoft_calendar_view_all_pages(
-            access_token,
-            cid,
-            time_min_utc,
-            time_max_utc,
-        )
+        items = microsoft_calendar_view_all_pages(access_token, cid, time_min_utc, time_max_utc)
 
         for ev in items:
             calendar_view_event_count += 1
@@ -1248,22 +1629,12 @@ def microsoft_collect_busy_utc(
                 continue
 
             show_as = str(ev.get("showAs") or "").strip().lower()
-
             if show_as == "free":
                 continue
 
-            s_utc = microsoft_event_time_to_utc(
-                ev.get("start") or {},
-                fallback_tz_name=tz_name,
-            )
-            e_utc = microsoft_event_time_to_utc(
-                ev.get("end") or {},
-                fallback_tz_name=tz_name,
-            )
-
-            if not s_utc or not e_utc:
-                continue
-            if e_utc <= s_utc:
+            s_utc = microsoft_event_time_to_utc(ev.get("start") or {}, fallback_tz_name=tz_name)
+            e_utc = microsoft_event_time_to_utc(ev.get("end") or {}, fallback_tz_name=tz_name)
+            if not s_utc or not e_utc or e_utc <= s_utc:
                 continue
 
             busy.append((s_utc, e_utc))
@@ -1276,10 +1647,7 @@ def microsoft_collect_busy_utc(
         "checkedCalendars": list(calendar_ids),
         "timeMinUtc": iso_z(time_min_utc),
         "timeMaxUtc": iso_z(time_max_utc),
-        "busyMerged": [
-            {"startUtc": iso_z(s), "endUtc": iso_z(e)}
-            for s, e in merged
-        ],
+        "busyMerged": [{"startUtc": iso_z(s), "endUtc": iso_z(e)} for s, e in merged],
         "debug": {
             "calendarViewEventCount": calendar_view_event_count,
             "calendarViewBusyCount": calendar_view_busy_count,
@@ -1299,7 +1667,6 @@ def microsoft_collect_busy_utc_excluding_event(
 
     for cid in calendar_ids:
         items = microsoft_calendar_view_all_pages(access_token, cid, time_min_utc, time_max_utc)
-
         for ev in items:
             if (ev.get("id") or "") == exclude_event_id:
                 continue
@@ -1312,7 +1679,6 @@ def microsoft_collect_busy_utc_excluding_event(
 
             s_utc = microsoft_event_time_to_utc(ev.get("start") or {}, fallback_tz_name=fallback_tz_name)
             e_utc = microsoft_event_time_to_utc(ev.get("end") or {}, fallback_tz_name=fallback_tz_name)
-
             if not s_utc or not e_utc or e_utc <= s_utc:
                 continue
 
@@ -1413,12 +1779,34 @@ def collect_busy_utc(
     calendar_ids: List[str],
     time_min_utc: datetime,
     time_max_utc: datetime,
+    customer_id: Optional[str] = None,
+    exclude_hold_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     if provider == PROVIDER_GOOGLE:
-        return google_collect_busy_utc(access_token, tz_name, calendar_ids, time_min_utc, time_max_utc)
-    if provider == PROVIDER_MICROSOFT:
-        return microsoft_collect_busy_utc(access_token, tz_name, calendar_ids, time_min_utc, time_max_utc)
-    raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}")
+        pack = google_collect_busy_utc(access_token, tz_name, calendar_ids, time_min_utc, time_max_utc)
+    elif provider == PROVIDER_MICROSOFT:
+        pack = microsoft_collect_busy_utc(access_token, tz_name, calendar_ids, time_min_utc, time_max_utc)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}")
+
+    merged_busy = [
+        (parse_iso_to_utc(x["startUtc"]), parse_iso_to_utc(x["endUtc"]))
+        for x in pack.get("busyMerged", [])
+    ]
+
+    if customer_id:
+        hold_busy = list_active_holds(
+            provider=provider,
+            customer_id=customer_id,
+            time_min_utc=time_min_utc,
+            time_max_utc=time_max_utc,
+            exclude_hold_token=exclude_hold_token,
+        )
+        merged_busy.extend(hold_busy)
+
+    merged_busy = merge_intervals_dt(merged_busy)
+    pack["busyMerged"] = [{"startUtc": iso_z(s), "endUtc": iso_z(e)} for s, e in merged_busy]
+    return pack
 
 
 def collect_busy_utc_excluding_event(
@@ -1465,6 +1853,7 @@ def compute_availability_from_busy(
     days: int,
     preferred_utc: Optional[datetime] = None,
     preference: Optional[Dict[str, Any]] = None,
+    blackout_dates: Optional[set[str]] = None,
 ) -> Dict[str, Any]:
     tz = zoneinfo_from_any_tz(tz_name, fallback="UTC")
     now_local = datetime.now(tz).replace(second=0, microsecond=0)
@@ -1478,12 +1867,16 @@ def compute_availability_from_busy(
 
     dur = timedelta(minutes=int(duration_minutes))
     step = timedelta(minutes=int(step_minutes))
+    closed_dates = blackout_dates or set()
 
     available: List[Dict[str, str]] = []
     busy_ptr = 0
 
     for day_offset in range(int(days)):
         d = start_day + timedelta(days=day_offset)
+        if d.isoformat() in closed_dates:
+            continue
+
         weekday = datetime(d.year, d.month, d.day, 0, 0, tzinfo=tz).weekday()
         if weekday not in work_days:
             continue
@@ -1834,7 +2227,15 @@ def freebusy_handler(provider: str, request: Request, payload: Dict[str, Any]):
     rt = load_refresh_token(provider, customer_id)
     access_token = refresh_access_token(provider, rt)
 
-    pack = collect_busy_utc(provider, access_token, tz_name, calendar_ids, time_min, time_max)
+    pack = collect_busy_utc(
+        provider=provider,
+        access_token=access_token,
+        tz_name=tz_name,
+        calendar_ids=calendar_ids,
+        time_min_utc=time_min,
+        time_max_utc=time_max,
+        customer_id=customer_id,
+    )
     pack["isFree"] = len(pack.get("busyMerged", [])) == 0
     pack["status"] = "free" if pack["isFree"] else "busy"
     return pack
@@ -1888,7 +2289,15 @@ def check_availability_handler(provider: str, request: Request, payload: Dict[st
     exact_min = start_utc - timedelta(minutes=1)
     exact_max = end_utc + timedelta(minutes=1)
 
-    busy_pack = collect_busy_utc(provider, access_token, tz_name, calendar_ids, exact_min, exact_max)
+    busy_pack = collect_busy_utc(
+        provider=provider,
+        access_token=access_token,
+        tz_name=tz_name,
+        calendar_ids=calendar_ids,
+        time_min_utc=exact_min,
+        time_max_utc=exact_max,
+        customer_id=customer_id,
+    )
     merged_busy = [
         (parse_iso_to_utc(x["startUtc"]), parse_iso_to_utc(x["endUtc"]))
         for x in busy_pack.get("busyMerged", [])
@@ -1917,7 +2326,18 @@ def check_availability_handler(provider: str, request: Request, payload: Dict[st
     horizon_min_utc = now_local.astimezone(timezone.utc)
     horizon_max_utc = horizon_end_local.astimezone(timezone.utc)
 
-    horizon_busy_pack = collect_busy_utc(provider, access_token, tz_name, calendar_ids, horizon_min_utc, horizon_max_utc)
+    years = nth_years_to_cover(datetime.now().year, datetime.now().year + 1, start_utc.year, end_utc.year)
+    closed_dates = combined_closed_date_set(customer_id, years=years)
+
+    horizon_busy_pack = collect_busy_utc(
+        provider=provider,
+        access_token=access_token,
+        tz_name=tz_name,
+        calendar_ids=calendar_ids,
+        time_min_utc=horizon_min_utc,
+        time_max_utc=horizon_max_utc,
+        customer_id=customer_id,
+    )
     horizon_merged_busy = [
         (parse_iso_to_utc(x["startUtc"]), parse_iso_to_utc(x["endUtc"]))
         for x in horizon_busy_pack.get("busyMerged", [])
@@ -1935,6 +2355,7 @@ def check_availability_handler(provider: str, request: Request, payload: Dict[st
         days=days,
         preferred_utc=preferred_utc,
         preference=preference,
+        blackout_dates=closed_dates,
     )
 
     if is_free:
@@ -2014,11 +2435,7 @@ def availability_handler(provider: str, request: Request, payload: Dict[str, Any
     days = int(payload.get("days", 7))
 
     cal_ids = payload.get("calendarIds")
-    calendar_ids = cal_ids if isinstance(cal_ids, list) and cal_ids else selected_calendar_ids(
-        provider,
-        customer_id,
-        provider_default_calendar_id(provider),
-    )
+    calendar_ids = cal_ids if isinstance(cal_ids, list) and cal_ids else selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider))
     calendar_ids = [c for c in calendar_ids if c]
     if not calendar_ids:
         raise HTTPException(status_code=400, detail=f"No {provider} calendars selected/found")
@@ -2050,7 +2467,18 @@ def availability_handler(provider: str, request: Request, payload: Dict[str, Any
     time_min_utc = now_local.astimezone(timezone.utc)
     time_max_utc = horizon_end_local.astimezone(timezone.utc)
 
-    busy_pack = collect_busy_utc(provider, access_token, tz_name, calendar_ids, time_min_utc, time_max_utc)
+    current_year = datetime.now().year
+    closed_dates = combined_closed_date_set(customer_id, years=[current_year, current_year + 1])
+
+    busy_pack = collect_busy_utc(
+        provider=provider,
+        access_token=access_token,
+        tz_name=tz_name,
+        calendar_ids=calendar_ids,
+        time_min_utc=time_min_utc,
+        time_max_utc=time_max_utc,
+        customer_id=customer_id,
+    )
     merged_busy = [
         (parse_iso_to_utc(x["startUtc"]), parse_iso_to_utc(x["endUtc"]))
         for x in busy_pack.get("busyMerged", [])
@@ -2068,6 +2496,7 @@ def availability_handler(provider: str, request: Request, payload: Dict[str, Any
         days=days,
         preferred_utc=preferred_utc,
         preference=preference,
+        blackout_dates=closed_dates,
     )
     out["provider"] = provider
     out["calendarIdsUsed"] = calendar_ids
@@ -2122,6 +2551,17 @@ def create_event_handler(provider: str, request: Request, payload: Dict[str, Any
     if end_utc <= start_utc:
         return {"booked": False, "reason": "invalid_range", "message": "end must be after start"}
 
+    local_tz = zoneinfo_from_any_tz(tz_name, fallback="UTC")
+    start_local_date = start_utc.astimezone(local_tz).date().isoformat()
+    closed_dates = combined_closed_date_set(customer_id, years=[start_utc.year, end_utc.year])
+
+    if start_local_date in closed_dates:
+        return {
+            "booked": False,
+            "reason": "closed_date",
+            "message": "That business is closed on the requested date. Please pick another day.",
+        }
+
     rt = load_refresh_token(provider, customer_id)
     access_token = refresh_access_token(provider, rt)
 
@@ -2133,11 +2573,16 @@ def create_event_handler(provider: str, request: Request, payload: Dict[str, Any
     time_min = start_utc - timedelta(minutes=1)
     time_max = end_utc + timedelta(minutes=1)
 
-    busy_pack = collect_busy_utc(provider, access_token, tz_name, calendars_to_check, time_min, time_max)
-    merged_busy = [
-        (parse_iso_to_utc(x["startUtc"]), parse_iso_to_utc(x["endUtc"]))
-        for x in busy_pack.get("busyMerged", [])
-    ]
+    busy_pack = collect_busy_utc(
+        provider=provider,
+        access_token=access_token,
+        tz_name=tz_name,
+        calendar_ids=calendars_to_check,
+        time_min_utc=time_min,
+        time_max_utc=time_max,
+        customer_id=customer_id,
+    )
+    merged_busy = [(parse_iso_to_utc(x["startUtc"]), parse_iso_to_utc(x["endUtc"])) for x in busy_pack["busyMerged"]]
     merged_busy = merge_intervals_dt(merged_busy)
 
     for bs, be in merged_busy:
@@ -2328,6 +2773,18 @@ def reschedule_events_handler(provider: str, request: Request, payload: Dict[str
             results.append({"eventId": ev_id, "rescheduled": False, "reason": "invalid_range"})
             continue
 
+        local_tz = zoneinfo_from_any_tz(tz_name, fallback="UTC")
+        new_local_date = new_start.astimezone(local_tz).date().isoformat()
+        closed_dates = combined_closed_date_set(customer_id, years=[new_start.year, new_end.year])
+        if new_local_date in closed_dates:
+            results.append({
+                "eventId": ev_id,
+                "rescheduled": False,
+                "reason": "closed_date",
+                "message": "That business is closed on the requested date. Please pick another day.",
+            })
+            continue
+
         time_min = new_start - timedelta(minutes=1)
         time_max = new_end + timedelta(minutes=1)
 
@@ -2341,6 +2798,14 @@ def reschedule_events_handler(provider: str, request: Request, payload: Dict[str
             exclude_event_id=ev_id,
             tz_name=tz_name,
         )
+
+        hold_busy = list_active_holds(
+            provider=provider,
+            customer_id=customer_id,
+            time_min_utc=time_min,
+            time_max_utc=time_max,
+        )
+        busy_merged = merge_intervals_dt(busy_merged + hold_busy)
 
         taken = any(overlaps(new_start, new_end, bs, be) for bs, be in busy_merged)
         if taken:
@@ -2369,6 +2834,396 @@ def reschedule_events_handler(provider: str, request: Request, payload: Dict[str
         results.append(row)
 
     return {"ok": True, "provider": provider, "requested": len(items), "processed": len(results), "results": results}
+
+
+# =============================================================================
+# Unified schedule endpoint
+# =============================================================================
+@app.post("/schedule")
+async def schedule(request: Request, payload: Dict[str, Any]):
+    require_api_key(request)
+
+    provider = validate_provider((payload.get("provider") or "").strip().lower())
+    intent = (payload.get("intent") or "").strip().lower()
+    customer_id = (payload.get("customerId") or "").strip()
+
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="customerId required")
+
+    if intent == "search":
+        search_payload = {
+            "customerId": customer_id,
+            "timeZone": payload.get("timeZone") or "America/Denver",
+            "email": ((payload.get("search") or {}).get("email") if isinstance(payload.get("search"), dict) else "") or payload.get("email") or "",
+            "phone": ((payload.get("search") or {}).get("phone") if isinstance(payload.get("search"), dict) else "") or payload.get("phone") or "",
+            "timeMinUtc": payload.get("timeMinUtc") or "",
+            "timeMaxUtc": payload.get("timeMaxUtc") or "",
+            "calendarIds": payload.get("calendarIds") or [],
+            "searchAttendees": True,
+        }
+        out = search_events_handler(provider, request, search_payload)
+        return {
+            "ok": True,
+            "intent": "search",
+            "provider": provider,
+            "customerId": customer_id,
+            "actionTaken": "searched",
+            "message": f"Found {out.get('count', 0)} matching appointment(s)." if out.get("count", 0) else "I could not find any matching appointments.",
+            "needsUserChoice": out.get("count", 0) > 1,
+            "needsMoreInfo": out.get("count", 0) == 0,
+            "booked": False,
+            "cancelled": False,
+            "rescheduled": False,
+            "matches": out.get("matches", []),
+            "results": [],
+            "suggestions": [],
+            "available": [],
+            "event": None,
+        }
+
+    if intent == "cancel":
+        out = cancel_events_handler(provider, request, {
+            "customerId": customer_id,
+            "items": payload.get("items") or [],
+        })
+        success = any(x.get("cancelled") for x in out.get("results", []))
+        return {
+            "ok": True,
+            "intent": "cancel",
+            "provider": provider,
+            "customerId": customer_id,
+            "actionTaken": "cancelled" if success else "none",
+            "message": "Appointment cancelled successfully." if success else "I could not cancel that appointment.",
+            "needsUserChoice": False,
+            "needsMoreInfo": False,
+            "booked": False,
+            "cancelled": success,
+            "rescheduled": False,
+            "matches": [],
+            "results": out.get("results", []),
+            "suggestions": [],
+            "available": [],
+            "event": None,
+        }
+
+    if intent == "reschedule":
+        out = reschedule_events_handler(provider, request, {
+            "customerId": customer_id,
+            "timeZone": payload.get("timeZone") or "America/Denver",
+            "items": payload.get("items") or [],
+        })
+        success = any(x.get("rescheduled") for x in out.get("results", []))
+        slot_taken = any(x.get("reason") == "slot_taken" for x in out.get("results", []))
+        closed_date = any(x.get("reason") == "closed_date" for x in out.get("results", []))
+
+        msg = "Appointment rescheduled successfully."
+        if slot_taken:
+            msg = "Sorry, that time is taken. Please pick a different time."
+        elif closed_date:
+            msg = "That business is closed on the requested date. Please pick another day."
+        elif not success:
+            msg = "I could not reschedule that appointment."
+
+        return {
+            "ok": True,
+            "intent": "reschedule",
+            "provider": provider,
+            "customerId": customer_id,
+            "actionTaken": "rescheduled" if success else "none",
+            "message": msg,
+            "needsUserChoice": False,
+            "needsMoreInfo": False,
+            "booked": False,
+            "cancelled": False,
+            "rescheduled": success,
+            "matches": [],
+            "results": out.get("results", []),
+            "suggestions": [],
+            "available": [],
+            "event": None,
+        }
+
+    if intent == "schedule":
+        has_exact = bool((payload.get("startUtc") or "").strip() and (payload.get("endUtc") or "").strip())
+
+        if has_exact:
+            check_payload = {
+                "customerId": customer_id,
+                "timeZone": payload.get("timeZone") or "America/Denver",
+                "startUtc": payload.get("startUtc"),
+                "endUtc": payload.get("endUtc"),
+                "durationMinutes": payload.get("durationMinutes", 60),
+                "stepMinutes": payload.get("stepMinutes", 30),
+                "days": payload.get("days", 7),
+                "calendarIds": payload.get("calendarIds") or [],
+                "preference": payload.get("preference") or {},
+            }
+            check_out = check_availability_handler(provider, request, check_payload)
+
+            if not check_out.get("isFree"):
+                return {
+                    "ok": True,
+                    "intent": "schedule",
+                    "provider": provider,
+                    "customerId": customer_id,
+                    "actionTaken": "suggested",
+                    "message": "Sorry, that time is taken. Here are some other available times.",
+                    "needsUserChoice": False,
+                    "needsMoreInfo": False,
+                    "booked": False,
+                    "cancelled": False,
+                    "rescheduled": False,
+                    "matches": [],
+                    "results": [],
+                    "suggestions": check_out.get("suggestions", []),
+                    "available": check_out.get("available", []),
+                    "event": None,
+                }
+
+            hold = create_slot_hold(
+                provider=provider,
+                customer_id=customer_id,
+                calendar_id=(payload.get("calendarId") or ""),
+                start_utc=parse_iso_to_utc(payload.get("startUtc")),
+                end_utc=parse_iso_to_utc(payload.get("endUtc")),
+                ttl_seconds=int(payload.get("ttlSeconds", 300)),
+            )
+
+            create_payload = {
+                "customerId": customer_id,
+                "timeZone": payload.get("timeZone") or "America/Denver",
+                "calendarId": payload.get("calendarId") or "",
+                "summary": payload.get("summary") or "Appointment",
+                "description": payload.get("description") or "",
+                "attendees": payload.get("attendees") or [],
+                "start": {"dateTime": payload.get("startUtc")},
+                "end": {"dateTime": payload.get("endUtc")},
+            }
+
+            create_out = create_event_handler(provider, request, create_payload)
+            release_slot_hold(hold["holdToken"])
+
+            if create_out.get("booked"):
+                return {
+                    "ok": True,
+                    "intent": "schedule",
+                    "provider": provider,
+                    "customerId": customer_id,
+                    "actionTaken": "booked",
+                    "message": "Appointment booked successfully.",
+                    "needsUserChoice": False,
+                    "needsMoreInfo": False,
+                    "booked": True,
+                    "cancelled": False,
+                    "rescheduled": False,
+                    "hold": hold,
+                    "matches": [],
+                    "results": [],
+                    "suggestions": [],
+                    "available": [],
+                    "event": create_out.get("event"),
+                }
+
+            return {
+                "ok": True,
+                "intent": "schedule",
+                "provider": provider,
+                "customerId": customer_id,
+                "actionTaken": "none",
+                "message": create_out.get("message") or "I could not book that appointment.",
+                "needsUserChoice": False,
+                "needsMoreInfo": False,
+                "booked": False,
+                "cancelled": False,
+                "rescheduled": False,
+                "hold": hold,
+                "matches": [],
+                "results": [],
+                "suggestions": [],
+                "available": [],
+                "event": None,
+            }
+
+        avail_payload = {
+            "customerId": customer_id,
+            "timeZone": payload.get("timeZone") or "America/Denver",
+            "durationMinutes": payload.get("durationMinutes", 60),
+            "stepMinutes": payload.get("stepMinutes", 30),
+            "days": payload.get("days", 14),
+            "calendarIds": payload.get("calendarIds") or [],
+            "preferredDateTimeUtc": payload.get("preferredDateTimeUtc") or "",
+            "preference": payload.get("preference") or {},
+        }
+        avail_out = availability_handler(provider, request, avail_payload)
+
+        return {
+            "ok": True,
+            "intent": "schedule",
+            "provider": provider,
+            "customerId": customer_id,
+            "actionTaken": "suggested" if avail_out.get("availableCount", 0) > 0 else "none",
+            "message": "Here are the best available times." if avail_out.get("availableCount", 0) > 0 else "I could not find any available times.",
+            "needsUserChoice": avail_out.get("availableCount", 0) > 0,
+            "needsMoreInfo": avail_out.get("availableCount", 0) == 0,
+            "booked": False,
+            "cancelled": False,
+            "rescheduled": False,
+            "matches": [],
+            "results": [],
+            "suggestions": avail_out.get("suggestions", []),
+            "available": avail_out.get("available", []),
+            "event": None,
+        }
+
+    raise HTTPException(status_code=400, detail="Unsupported intent")
+
+
+# =============================================================================
+# Hold endpoints
+# =============================================================================
+@app.post("/holds/create")
+async def create_hold_endpoint(request: Request, payload: Dict[str, Any]):
+    require_api_key(request)
+
+    provider = validate_provider((payload.get("provider") or "").strip().lower())
+    customer_id = (payload.get("customerId") or "").strip()
+    calendar_id = (payload.get("calendarId") or "").strip()
+    tz_name = (payload.get("timeZone") or "America/Denver").strip()
+    ttl_seconds = int(payload.get("ttlSeconds", 300))
+
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="customerId required")
+
+    try:
+        start_utc = parse_any_datetime_to_utc((payload.get("startUtc") or "").strip(), tz_name)
+        end_utc = parse_any_datetime_to_utc((payload.get("endUtc") or "").strip(), tz_name)
+    except Exception:
+        raise HTTPException(status_code=400, detail="startUtc/endUtc required")
+
+    if end_utc <= start_utc:
+        raise HTTPException(status_code=400, detail="endUtc must be after startUtc")
+
+    rt = load_refresh_token(provider, customer_id)
+    access_token = refresh_access_token(provider, rt)
+
+    cal_ids = payload.get("calendarIds")
+    calendar_ids = cal_ids if isinstance(cal_ids, list) and cal_ids else selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider))
+    calendar_ids = [c for c in calendar_ids if c]
+    if calendar_id and calendar_id not in calendar_ids:
+        calendar_ids = [calendar_id] + calendar_ids
+
+    busy_pack = collect_busy_utc(
+        provider=provider,
+        access_token=access_token,
+        tz_name=tz_name,
+        calendar_ids=calendar_ids,
+        time_min_utc=start_utc - timedelta(minutes=1),
+        time_max_utc=end_utc + timedelta(minutes=1),
+        customer_id=customer_id,
+    )
+
+    merged_busy = [
+        (parse_iso_to_utc(x["startUtc"]), parse_iso_to_utc(x["endUtc"]))
+        for x in busy_pack.get("busyMerged", [])
+    ]
+
+    if any(overlaps(start_utc, end_utc, bs, be) for bs, be in merged_busy):
+        return {
+            "ok": True,
+            "held": False,
+            "reason": "slot_taken",
+            "message": "Sorry, that slot is not available.",
+            "busyMerged": busy_pack.get("busyMerged", []),
+        }
+
+    hold = create_slot_hold(
+        provider=provider,
+        customer_id=customer_id,
+        calendar_id=calendar_id or "",
+        start_utc=start_utc,
+        end_utc=end_utc,
+        ttl_seconds=ttl_seconds,
+    )
+
+    return {
+        "ok": True,
+        "held": True,
+        "message": "Slot hold created.",
+        "hold": hold,
+    }
+
+
+@app.post("/holds/release")
+async def release_hold_endpoint(request: Request, payload: Dict[str, Any]):
+    require_api_key(request)
+    hold_token = (payload.get("holdToken") or "").strip()
+    if not hold_token:
+        raise HTTPException(status_code=400, detail="holdToken required")
+
+    ok = release_slot_hold(hold_token)
+    return {
+        "ok": True,
+        "released": ok,
+        "message": "Hold released." if ok else "Hold was not found or already expired.",
+    }
+
+
+# =============================================================================
+# Holiday / blackout endpoints
+# =============================================================================
+@app.get("/customers/{customer_id}/blackout_dates")
+def get_blackout_dates(request: Request, customer_id: str):
+    require_api_key(request)
+    return {
+        "ok": True,
+        "customerId": customer_id,
+        "blackoutDates": list_blackout_dates(customer_id),
+    }
+
+
+@app.post("/customers/{customer_id}/blackout_dates")
+async def add_blackout_dates(request: Request, customer_id: str, payload: Dict[str, Any]):
+    require_api_key(request)
+    items = payload.get("items") or []
+    out = upsert_blackout_dates(customer_id, items)
+    return {
+        "ok": True,
+        "customerId": customer_id,
+        "blackoutDates": out,
+    }
+
+
+@app.delete("/customers/{customer_id}/blackout_dates")
+async def remove_blackout_dates(request: Request, customer_id: str, payload: Dict[str, Any]):
+    require_api_key(request)
+    dates = payload.get("dates") or []
+    out = delete_blackout_dates(customer_id, dates)
+    return {
+        "ok": True,
+        "customerId": customer_id,
+        "blackoutDates": out,
+    }
+
+
+@app.get("/customers/{customer_id}/holiday_calendars")
+def get_holiday_calendars(request: Request, customer_id: str):
+    require_api_key(request)
+    return {
+        "ok": True,
+        "customerId": customer_id,
+        "holidayCalendars": load_holiday_calendars(customer_id),
+    }
+
+
+@app.post("/customers/{customer_id}/holiday_calendars")
+async def set_holiday_calendars(request: Request, customer_id: str, payload: Dict[str, Any]):
+    require_api_key(request)
+    out = save_holiday_calendars(customer_id, payload)
+    return {
+        "ok": True,
+        "customerId": customer_id,
+        "holidayCalendars": out,
+    }
 
 
 # =============================================================================
@@ -2482,7 +3337,7 @@ async def reschedule_events(provider: str, request: Request, payload: Dict[str, 
 
 
 # =============================================================================
-# Backward-compatible wrapper routes
+# Wrapper routes
 # =============================================================================
 @app.get("/oauth/google/start")
 def oauth_google_start(customerId: str = Query(...)):
