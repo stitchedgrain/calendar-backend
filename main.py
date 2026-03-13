@@ -2269,7 +2269,9 @@ def check_availability_handler(provider: str, request: Request, payload: Dict[st
     if end_utc <= start_utc:
         raise HTTPException(status_code=400, detail="endUtc must be after startUtc")
 
-    duration_minutes = int(payload.get("durationMinutes", max(1, int((end_utc - start_utc).total_seconds() // 60))))
+    duration_minutes = int(
+        payload.get("durationMinutes", max(1, int((end_utc - start_utc).total_seconds() // 60)))
+    )
     step_minutes = int(payload.get("stepMinutes", 30))
     days = int(payload.get("days", 7))
 
@@ -2290,15 +2292,15 @@ def check_availability_handler(provider: str, request: Request, payload: Dict[st
     exact_max = end_utc + timedelta(minutes=1)
 
     busy_pack = collect_busy_utc(
-    provider=provider,
-    access_token=access_token,
-    tz_name=tz_name,
-    calendar_ids=calendars_to_check,
-    time_min_utc=time_min,
-    time_max_utc=time_max,
-    customer_id=customer_id,
-    exclude_hold_token=exclude_hold_token,
-)
+        provider=provider,
+        access_token=access_token,
+        tz_name=tz_name,
+        calendar_ids=calendar_ids,
+        time_min_utc=exact_min,
+        time_max_utc=exact_max,
+        customer_id=customer_id,
+    )
+
     merged_busy = [
         (parse_iso_to_utc(x["startUtc"]), parse_iso_to_utc(x["endUtc"]))
         for x in busy_pack.get("busyMerged", [])
@@ -2339,6 +2341,7 @@ def check_availability_handler(provider: str, request: Request, payload: Dict[st
         time_max_utc=horizon_max_utc,
         customer_id=customer_id,
     )
+
     horizon_merged_busy = [
         (parse_iso_to_utc(x["startUtc"]), parse_iso_to_utc(x["endUtc"]))
         for x in horizon_busy_pack.get("busyMerged", [])
