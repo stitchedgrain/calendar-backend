@@ -3198,7 +3198,59 @@ async def schedule(request: Request, payload: Dict[str, Any]):
         )
         return base
 
-                hold = create_slot_hold(
+    if intent == "schedule":
+        has_exact = bool((payload.get("startUtc") or "").strip() and (payload.get("endUtc") or "").strip())
+
+        if has_exact:
+            check_payload = {
+                "customerId": customer_id,
+                "timeZone": payload.get("timeZone") or "America/Denver",
+                "startUtc": payload.get("startUtc"),
+                "endUtc": payload.get("endUtc"),
+                "durationMinutes": payload.get("durationMinutes", 60),
+                "stepMinutes": payload.get("stepMinutes", 30),
+                "days": payload.get("days", 7),
+                "calendarIds": payload.get("calendarIds") or [],
+                "preference": payload.get("preference") or {},
+            }
+            check_out = check_availability_handler(provider, request, check_payload)
+
+            if not check_out.get("isFree"):
+                suggestions = check_out.get("suggestions", [])
+                base = {
+                    "ok": True,
+                    "intent": "schedule",
+                    "provider": provider,
+                    "customerId": customer_id,
+                    "actionTaken": "suggested",
+                    "message": "Sorry, that time is taken. Here are some other available times.",
+                    "needsUserChoice": True,
+                    "needsMoreInfo": False,
+                    "booked": False,
+                    "cancelled": False,
+                    "rescheduled": False,
+                    "matches": [],
+                    "results": [],
+                    "suggestions": suggestions,
+                    "available": check_out.get("available", []),
+                    "event": None,
+                }
+                base["assistantResponse"] = build_assistant_response(
+                    intent="schedule",
+                    action_taken="suggested",
+                    message=base["message"],
+                    needs_user_choice=True,
+                    needs_more_info=False,
+                    booked=False,
+                    cancelled=False,
+                    rescheduled=False,
+                    suggestions=suggestions,
+                    matches=[],
+                    results=[],
+                )
+                return base
+
+            hold = create_slot_hold(
                 provider=provider,
                 customer_id=customer_id,
                 calendar_id=(payload.get("calendarId") or ""),
@@ -3227,78 +3279,6 @@ async def schedule(request: Request, payload: Dict[str, Any]):
                 )
             finally:
                 release_slot_hold(hold["holdToken"])
-
-            if create_out.get("booked"):
-                base = {
-                    "ok": True,
-                    "intent": "schedule",
-                    "provider": provider,
-                    "customerId": customer_id,
-                    "actionTaken": "booked",
-                    "message": "Appointment booked successfully.",
-                    "needsUserChoice": False,
-                    "needsMoreInfo": False,
-                    "booked": True,
-                    "cancelled": False,
-                    "rescheduled": False,
-                    "hold": hold,
-                    "matches": [],
-                    "results": [],
-                    "suggestions": [],
-                    "available": [],
-                    "event": create_out.get("event"),
-                }
-                base["assistantResponse"] = build_assistant_response(
-                    intent="schedule",
-                    action_taken="booked",
-                    message=base["message"],
-                    needs_user_choice=False,
-                    needs_more_info=False,
-                    booked=True,
-                    cancelled=False,
-                    rescheduled=False,
-                    suggestions=[],
-                    matches=[],
-                    results=[],
-                    start_utc=(payload.get("startUtc") or "").strip(),
-                    end_utc=(payload.get("endUtc") or "").strip(),
-                )
-                return base
-
-            base = {
-                "ok": True,
-                "intent": "schedule",
-                "provider": provider,
-                "customerId": customer_id,
-                "actionTaken": "none",
-                "message": create_out.get("message") or "I could not book that appointment.",
-                "needsUserChoice": False,
-                "needsMoreInfo": False,
-                "booked": False,
-                "cancelled": False,
-                "rescheduled": False,
-                "hold": hold,
-                "matches": [],
-                "results": [],
-                "suggestions": [],
-                "available": [],
-                "event": None,
-            }
-            base["assistantResponse"] = build_assistant_response(
-                intent="schedule",
-                action_taken="none",
-                message=base["message"],
-                needs_user_choice=False,
-                needs_more_info=False,
-                booked=False,
-                cancelled=False,
-                rescheduled=False,
-                suggestions=[],
-                matches=[],
-                results=[],
-            )
-            return base
-            release_slot_hold(hold["holdToken"])
 
             if create_out.get("booked"):
                 base = {
@@ -3417,3 +3397,294 @@ async def schedule(request: Request, payload: Dict[str, Any]):
         return base
 
     raise HTTPException(status_code=400, detail="Unsupported intent")
+
+
+# =============================================================================
+# Holiday / blackout endpoints
+# =============================================================================
+@app.get("/customers/{customer_id}/blackout_dates")
+def get_blackout_dates(request: Request, customer_id: str):
+    require_api_key(request)
+    return {
+        "ok": True,
+        "customerId": customer_id,
+        "blackoutDates": list_blackout_dates(customer_id),
+    }
+
+
+@app.post("/customers/{customer_id}/blackout_dates")
+async def add_blackout_dates(request: Request, customer_id: str, payload: Dict[str, Any]):
+    require_api_key(request)
+    items = payload.get("items") or []
+    out = upsert_blackout_dates(customer_id, items)
+    return {
+        "ok": True,
+        "customerId": customer_id,
+        "blackoutDates": out,
+    }
+
+
+@app.delete("/customers/{customer_id}/blackout_dates")
+async def remove_blackout_dates(request: Request, customer_id: str, payload: Dict[str, Any]):
+    require_api_key(request)
+    dates = payload.get("dates") or []
+    out = delete_blackout_dates(customer_id, dates)
+    return {
+        "ok": True,
+        "customerId": customer_id,
+        "blackoutDates": out,
+    }
+
+
+@app.get("/customers/{customer_id}/holiday_calendars")
+def get_holiday_calendars(request: Request, customer_id: str):
+    require_api_key(request)
+    return {
+        "ok": True,
+        "customerId": customer_id,
+        "holidayCalendars": load_holiday_calendars(customer_id),
+    }
+
+
+@app.post("/customers/{customer_id}/holiday_calendars")
+async def set_holiday_calendars(request: Request, customer_id: str, payload: Dict[str, Any]):
+    require_api_key(request)
+    out = save_holiday_calendars(customer_id, payload)
+    return {
+        "ok": True,
+        "customerId": customer_id,
+        "holidayCalendars": out,
+    }
+
+
+# =============================================================================
+# Health / debug
+# =============================================================================
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
+@app.get("/debug/db")
+def debug_db(request: Request):
+    require_debug_key(request)
+    with engine.begin() as conn:
+        v = conn.execute(text("SELECT 1")).scalar_one()
+    return {"db_ok": True, "select_1": v}
+
+
+@app.get("/debug/schema")
+def debug_schema(request: Request):
+    require_debug_key(request)
+    out: Dict[str, Any] = {"tables": []}
+    with engine.begin() as conn:
+        tables = conn.execute(
+            text("""
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema='public'
+                ORDER BY table_name
+            """)
+        ).fetchall()
+        out["tables"] = [t[0] for t in tables]
+
+        for tname in out["tables"]:
+            cols = conn.execute(
+                text("""
+                    SELECT column_name AS name, data_type AS type
+                    FROM information_schema.columns
+                    WHERE table_schema='public' AND table_name=:t
+                    ORDER BY ordinal_position
+                """),
+                {"t": tname},
+            ).fetchall()
+            out[tname] = [{"name": c[0], "type": c[1]} for c in cols]
+    return out
+
+
+# =============================================================================
+# Generic provider routes
+# =============================================================================
+@app.get("/oauth/{provider}/start")
+def oauth_start(provider: str, customerId: str = Query(...)):
+    return oauth_start_handler(provider, customerId)
+
+
+@app.get("/oauth/{provider}/callback")
+def oauth_callback(provider: str, code: str = "", state: str = "", error: str = ""):
+    provider = validate_provider(provider)
+    return oauth_callback_handler(code, state, error)
+
+
+@app.get("/{provider}/calendars")
+def calendars(provider: str, request: Request, customerId: str):
+    return calendars_handler(provider, request, customerId)
+
+
+@app.post("/{provider}/calendars/select")
+async def calendars_select(provider: str, request: Request, payload: Dict[str, Any]):
+    return calendars_select_handler(provider, request, payload)
+
+
+@app.post("/{provider}/settings")
+async def provider_settings(provider: str, request: Request, payload: Dict[str, Any]):
+    validate_provider(provider)
+    return settings_handler(request, payload)
+
+
+@app.post("/{provider}/freebusy")
+async def freebusy(provider: str, request: Request, payload: Dict[str, Any]):
+    return freebusy_handler(provider, request, payload)
+
+
+@app.post("/{provider}/check_availability")
+async def check_availability(provider: str, request: Request, payload: Dict[str, Any]):
+    return check_availability_handler(provider, request, payload)
+
+
+@app.post("/{provider}/availability")
+async def availability(provider: str, request: Request, payload: Dict[str, Any]):
+    return availability_handler(provider, request, payload)
+
+
+@app.post("/{provider}/create_event")
+async def create_event(provider: str, request: Request, payload: Dict[str, Any]):
+    return create_event_handler(provider, request, payload)
+
+
+@app.post("/{provider}/search_events")
+async def search_events(provider: str, request: Request, payload: Dict[str, Any]):
+    return search_events_handler(provider, request, payload)
+
+
+@app.post("/{provider}/cancel_events")
+async def cancel_events(provider: str, request: Request, payload: Dict[str, Any]):
+    return cancel_events_handler(provider, request, payload)
+
+
+@app.post("/{provider}/reschedule_events")
+async def reschedule_events(provider: str, request: Request, payload: Dict[str, Any]):
+    return reschedule_events_handler(provider, request, payload)
+
+
+# =============================================================================
+# Wrapper routes
+# =============================================================================
+@app.get("/oauth/google/start")
+def oauth_google_start(customerId: str = Query(...)):
+    return oauth_start_handler(PROVIDER_GOOGLE, customerId)
+
+
+@app.get("/oauth/google/callback")
+def oauth_google_callback(code: str = "", state: str = "", error: str = ""):
+    return oauth_callback_handler(code, state, error)
+
+
+@app.get("/oauth/microsoft/start")
+def oauth_microsoft_start(customerId: str = Query(...)):
+    return oauth_start_handler(PROVIDER_MICROSOFT, customerId)
+
+
+@app.get("/oauth/microsoft/callback")
+def oauth_microsoft_callback(code: str = "", state: str = "", error: str = ""):
+    return oauth_callback_handler(code, state, error)
+
+
+@app.get("/google/calendars")
+def google_calendars(request: Request, customerId: str):
+    return calendars_handler(PROVIDER_GOOGLE, request, customerId)
+
+
+@app.post("/google/calendars/select")
+async def google_calendars_select(request: Request, payload: Dict[str, Any]):
+    return calendars_select_handler(PROVIDER_GOOGLE, request, payload)
+
+
+@app.post("/google/settings")
+async def google_settings(request: Request, payload: Dict[str, Any]):
+    return settings_handler(request, payload)
+
+
+@app.post("/google/freebusy")
+async def google_freebusy(request: Request, payload: Dict[str, Any]):
+    return freebusy_handler(PROVIDER_GOOGLE, request, payload)
+
+
+@app.post("/google/check_availability")
+async def google_check_availability(request: Request, payload: Dict[str, Any]):
+    return check_availability_handler(PROVIDER_GOOGLE, request, payload)
+
+
+@app.post("/google/availability")
+async def google_availability(request: Request, payload: Dict[str, Any]):
+    return availability_handler(PROVIDER_GOOGLE, request, payload)
+
+
+@app.post("/google/create_event")
+async def google_create_event(request: Request, payload: Dict[str, Any]):
+    return create_event_handler(PROVIDER_GOOGLE, request, payload)
+
+
+@app.post("/google/search_events")
+async def google_search_events(request: Request, payload: Dict[str, Any]):
+    return search_events_handler(PROVIDER_GOOGLE, request, payload)
+
+
+@app.post("/google/cancel_events")
+async def google_cancel_events(request: Request, payload: Dict[str, Any]):
+    return cancel_events_handler(PROVIDER_GOOGLE, request, payload)
+
+
+@app.post("/google/reschedule_events")
+async def google_reschedule_events(request: Request, payload: Dict[str, Any]):
+    return reschedule_events_handler(PROVIDER_GOOGLE, request, payload)
+
+
+@app.get("/microsoft/calendars")
+def microsoft_calendars(request: Request, customerId: str):
+    return calendars_handler(PROVIDER_MICROSOFT, request, customerId)
+
+
+@app.post("/microsoft/calendars/select")
+async def microsoft_calendars_select(request: Request, payload: Dict[str, Any]):
+    return calendars_select_handler(PROVIDER_MICROSOFT, request, payload)
+
+
+@app.post("/microsoft/settings")
+async def microsoft_settings(request: Request, payload: Dict[str, Any]):
+    return settings_handler(request, payload)
+
+
+@app.post("/microsoft/freebusy")
+async def microsoft_freebusy(request: Request, payload: Dict[str, Any]):
+    return freebusy_handler(PROVIDER_MICROSOFT, request, payload)
+
+
+@app.post("/microsoft/check_availability")
+async def microsoft_check_availability(request: Request, payload: Dict[str, Any]):
+    return check_availability_handler(PROVIDER_MICROSOFT, request, payload)
+
+
+@app.post("/microsoft/availability")
+async def microsoft_availability(request: Request, payload: Dict[str, Any]):
+    return availability_handler(PROVIDER_MICROSOFT, request, payload)
+
+
+@app.post("/microsoft/create_event")
+async def microsoft_create_event(request: Request, payload: Dict[str, Any]):
+    return create_event_handler(PROVIDER_MICROSOFT, request, payload)
+
+
+@app.post("/microsoft/search_events")
+async def microsoft_search_events(request: Request, payload: Dict[str, Any]):
+    return search_events_handler(PROVIDER_MICROSOFT, request, payload)
+
+
+@app.post("/microsoft/cancel_events")
+async def microsoft_cancel_events(request: Request, payload: Dict[str, Any]):
+    return cancel_events_handler(PROVIDER_MICROSOFT, request, payload)
+
+
+@app.post("/microsoft/reschedule_events")
+async def microsoft_reschedule_events(request: Request, payload: Dict[str, Any]):
+    return reschedule_events_handler(PROVIDER_MICROSOFT, request, payload)
