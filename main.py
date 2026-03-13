@@ -3201,7 +3201,7 @@ async def schedule(request: Request, payload: Dict[str, Any]):
         )
         return base
 
-    if intent == "schedule":
+        if intent == "schedule":
         has_exact = bool((payload.get("startUtc") or "").strip() and (payload.get("endUtc") or "").strip())
 
         if has_exact:
@@ -3368,25 +3368,25 @@ async def schedule(request: Request, payload: Dict[str, Any]):
 
         picked_suggestions = avail_out.get("suggestions", []) or avail_out.get("available", [])[:3]
 
-base = {
-    "ok": True,
-    "intent": "schedule",
-    "provider": provider,
-    "customerId": customer_id,
-    "actionTaken": "suggested" if avail_out.get("availableCount", 0) > 0 else "none",
-    "message": "Here are the best available times." if avail_out.get("availableCount", 0) > 0 else "I could not find any available times.",
-    "needsUserChoice": avail_out.get("availableCount", 0) > 0,
-    "needsMoreInfo": avail_out.get("availableCount", 0) == 0,
-    "booked": False,
-    "cancelled": False,
-    "rescheduled": False,
-    "matches": [],
-    "results": [],
-    "suggestions": picked_suggestions,
-    "available": avail_out.get("available", []),
-    "event": None,
-}
-base["assistantResponse"] = build_assistant_response(
+        base = {
+            "ok": True,
+            "intent": "schedule",
+            "provider": provider,
+            "customerId": customer_id,
+            "actionTaken": "suggested" if avail_out.get("availableCount", 0) > 0 else "none",
+            "message": "Here are the best available times." if avail_out.get("availableCount", 0) > 0 else "I could not find any available times.",
+            "needsUserChoice": avail_out.get("availableCount", 0) > 0,
+            "needsMoreInfo": avail_out.get("availableCount", 0) == 0,
+            "booked": False,
+            "cancelled": False,
+            "rescheduled": False,
+            "matches": [],
+            "results": [],
+            "suggestions": picked_suggestions,
+            "available": avail_out.get("available", []),
+            "event": None,
+        }
+        base["assistantResponse"] = build_assistant_response(
             intent="schedule",
             action_taken=base["actionTaken"],
             message=base["message"],
@@ -3400,8 +3400,6 @@ base["assistantResponse"] = build_assistant_response(
             results=[],
         )
         return base
-
-    raise HTTPException(status_code=400, detail="Unsupported intent")
 
 
 # =============================================================================
