@@ -3036,8 +3036,8 @@ def build_assistant_response(
 # =============================================================================
 # Unified schedule endpoint
 # =============================================================================
-@app.post("/schedule")
-async def schedule(request: Request, payload: Dict[str, Any]):
+# @app.post("/schedule")
+async def schedule(request, payload: Dict[str, Any]):
     require_api_key(request)
 
     provider = validate_provider((payload.get("provider") or "").strip().lower())
@@ -3059,13 +3059,20 @@ async def schedule(request: Request, payload: Dict[str, Any]):
             "searchAttendees": True,
         }
         out = search_events_handler(provider, request, search_payload)
-        return {
+
+        message = (
+            f"Found {out.get('count', 0)} matching appointment(s)."
+            if out.get("count", 0)
+            else "I could not find any matching appointments."
+        )
+
+        base = {
             "ok": True,
             "intent": "search",
             "provider": provider,
             "customerId": customer_id,
             "actionTaken": "searched",
-            "message": f"Found {out.get('count', 0)} matching appointment(s)." if out.get("count", 0) else "I could not find any matching appointments.",
+            "message": message,
             "needsUserChoice": out.get("count", 0) > 1,
             "needsMoreInfo": out.get("count", 0) == 0,
             "booked": False,
@@ -3077,14 +3084,33 @@ async def schedule(request: Request, payload: Dict[str, Any]):
             "available": [],
             "event": None,
         }
+        base["assistantResponse"] = build_assistant_response(
+            intent="search",
+            action_taken=base["actionTaken"],
+            message=base["message"],
+            needs_user_choice=base["needsUserChoice"],
+            needs_more_info=base["needsMoreInfo"],
+            booked=False,
+            cancelled=False,
+            rescheduled=False,
+            suggestions=[],
+            matches=base["matches"],
+            results=[],
+        )
+        return base
 
     if intent == "cancel":
-        out = cancel_events_handler(provider, request, {
-            "customerId": customer_id,
-            "items": payload.get("items") or [],
-        })
+        out = cancel_events_handler(
+            provider,
+            request,
+            {
+                "customerId": customer_id,
+                "items": payload.get("items") or [],
+            },
+        )
         success = any(x.get("cancelled") for x in out.get("results", []))
-        return {
+
+        base = {
             "ok": True,
             "intent": "cancel",
             "provider": provider,
@@ -3102,13 +3128,31 @@ async def schedule(request: Request, payload: Dict[str, Any]):
             "available": [],
             "event": None,
         }
+        base["assistantResponse"] = build_assistant_response(
+            intent="cancel",
+            action_taken=base["actionTaken"],
+            message=base["message"],
+            needs_user_choice=False,
+            needs_more_info=False,
+            booked=False,
+            cancelled=success,
+            rescheduled=False,
+            suggestions=[],
+            matches=[],
+            results=base["results"],
+        )
+        return base
 
     if intent == "reschedule":
-        out = reschedule_events_handler(provider, request, {
-            "customerId": customer_id,
-            "timeZone": payload.get("timeZone") or "America/Denver",
-            "items": payload.get("items") or [],
-        })
+        out = reschedule_events_handler(
+            provider,
+            request,
+            {
+                "customerId": customer_id,
+                "timeZone": payload.get("timeZone") or "America/Denver",
+                "items": payload.get("items") or [],
+            },
+        )
         success = any(x.get("rescheduled") for x in out.get("results", []))
         slot_taken = any(x.get("reason") == "slot_taken" for x in out.get("results", []))
         closed_date = any(x.get("reason") == "closed_date" for x in out.get("results", []))
@@ -3121,7 +3165,7 @@ async def schedule(request: Request, payload: Dict[str, Any]):
         elif not success:
             msg = "I could not reschedule that appointment."
 
-        return {
+        base = {
             "ok": True,
             "intent": "reschedule",
             "provider": provider,
@@ -3139,6 +3183,20 @@ async def schedule(request: Request, payload: Dict[str, Any]):
             "available": [],
             "event": None,
         }
+        base["assistantResponse"] = build_assistant_response(
+            intent="reschedule",
+            action_taken=base["actionTaken"],
+            message=base["message"],
+            needs_user_choice=False,
+            needs_more_info=False,
+            booked=False,
+            cancelled=False,
+            rescheduled=success,
+            suggestions=[],
+            matches=[],
+            results=base["results"],
+        )
+        return base
 
     if intent == "schedule":
         has_exact = bool((payload.get("startUtc") or "").strip() and (payload.get("endUtc") or "").strip())
@@ -3158,24 +3216,39 @@ async def schedule(request: Request, payload: Dict[str, Any]):
             check_out = check_availability_handler(provider, request, check_payload)
 
             if not check_out.get("isFree"):
-                return {
+                suggestions = check_out.get("suggestions", [])
+                base = {
                     "ok": True,
                     "intent": "schedule",
                     "provider": provider,
                     "customerId": customer_id,
                     "actionTaken": "suggested",
                     "message": "Sorry, that time is taken. Here are some other available times.",
-                    "needsUserChoice": False,
+                    "needsUserChoice": True,
                     "needsMoreInfo": False,
                     "booked": False,
                     "cancelled": False,
                     "rescheduled": False,
                     "matches": [],
                     "results": [],
-                    "suggestions": check_out.get("suggestions", []),
+                    "suggestions": suggestions,
                     "available": check_out.get("available", []),
                     "event": None,
                 }
+                base["assistantResponse"] = build_assistant_response(
+                    intent="schedule",
+                    action_taken="suggested",
+                    message=base["message"],
+                    needs_user_choice=True,
+                    needs_more_info=False,
+                    booked=False,
+                    cancelled=False,
+                    rescheduled=False,
+                    suggestions=suggestions,
+                    matches=[],
+                    results=[],
+                )
+                return base
 
             hold = create_slot_hold(
                 provider=provider,
@@ -3201,7 +3274,7 @@ async def schedule(request: Request, payload: Dict[str, Any]):
             release_slot_hold(hold["holdToken"])
 
             if create_out.get("booked"):
-                return {
+                base = {
                     "ok": True,
                     "intent": "schedule",
                     "provider": provider,
@@ -3220,8 +3293,24 @@ async def schedule(request: Request, payload: Dict[str, Any]):
                     "available": [],
                     "event": create_out.get("event"),
                 }
+                base["assistantResponse"] = build_assistant_response(
+                    intent="schedule",
+                    action_taken="booked",
+                    message=base["message"],
+                    needs_user_choice=False,
+                    needs_more_info=False,
+                    booked=True,
+                    cancelled=False,
+                    rescheduled=False,
+                    suggestions=[],
+                    matches=[],
+                    results=[],
+                    start_utc=(payload.get("startUtc") or "").strip(),
+                    end_utc=(payload.get("endUtc") or "").strip(),
+                )
+                return base
 
-            return {
+            base = {
                 "ok": True,
                 "intent": "schedule",
                 "provider": provider,
@@ -3240,6 +3329,20 @@ async def schedule(request: Request, payload: Dict[str, Any]):
                 "available": [],
                 "event": None,
             }
+            base["assistantResponse"] = build_assistant_response(
+                intent="schedule",
+                action_taken="none",
+                message=base["message"],
+                needs_user_choice=False,
+                needs_more_info=False,
+                booked=False,
+                cancelled=False,
+                rescheduled=False,
+                suggestions=[],
+                matches=[],
+                results=[],
+            )
+            return base
 
         avail_payload = {
             "customerId": customer_id,
@@ -3253,7 +3356,7 @@ async def schedule(request: Request, payload: Dict[str, Any]):
         }
         avail_out = availability_handler(provider, request, avail_payload)
 
-        return {
+        base = {
             "ok": True,
             "intent": "schedule",
             "provider": provider,
@@ -3271,9 +3374,22 @@ async def schedule(request: Request, payload: Dict[str, Any]):
             "available": avail_out.get("available", []),
             "event": None,
         }
+        base["assistantResponse"] = build_assistant_response(
+            intent="schedule",
+            action_taken=base["actionTaken"],
+            message=base["message"],
+            needs_user_choice=base["needsUserChoice"],
+            needs_more_info=base["needsMoreInfo"],
+            booked=False,
+            cancelled=False,
+            rescheduled=False,
+            suggestions=base["suggestions"],
+            matches=[],
+            results=[],
+        )
+        return base
 
     raise HTTPException(status_code=400, detail="Unsupported intent")
-
 
 # =============================================================================
 # Hold endpoints
