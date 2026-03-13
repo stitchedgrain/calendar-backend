@@ -2506,7 +2506,12 @@ def availability_handler(provider: str, request: Request, payload: Dict[str, Any
     return out
 
 
-def create_event_handler(provider: str, request: Request, payload: Dict[str, Any]):
+def create_event_handler(
+    provider: str,
+    request: Request,
+    payload: Dict[str, Any],
+    exclude_hold_token: Optional[str] = None,
+):
     require_api_key(request)
     provider = validate_provider(provider)
 
