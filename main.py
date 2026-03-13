@@ -2087,7 +2087,7 @@ def provider_delete_event(provider: str, access_token: str, calendar_id: str, ev
     if provider == PROVIDER_GOOGLE:
         return google_delete_event_api(access_token, calendar_id, event_id)
     if provider == PROVIDER_MICROSOFT:
-        return microsoft_delete_event_api(access_token, event_id)
+        return microsoft_delete_event_api(access_token, calendar_id, event_id)
     raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}")
 
 
