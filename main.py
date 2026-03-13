@@ -3366,24 +3366,26 @@ async def schedule(request: Request, payload: Dict[str, Any]):
         }
         avail_out = availability_handler(provider, request, avail_payload)
 
-        base = {
-            "ok": True,
-            "intent": "schedule",
-            "provider": provider,
-            "customerId": customer_id,
-            "actionTaken": "suggested" if avail_out.get("availableCount", 0) > 0 else "none",
-            "message": "Here are the best available times." if avail_out.get("availableCount", 0) > 0 else "I could not find any available times.",
-            "needsUserChoice": avail_out.get("availableCount", 0) > 0,
-            "needsMoreInfo": avail_out.get("availableCount", 0) == 0,
-            "booked": False,
-            "cancelled": False,
-            "rescheduled": False,
-            "matches": [],
-            "results": [],
-            "suggestions": avail_out.get("suggestions", []),
-            "available": avail_out.get("available", []),
-            "event": None,
-        }
+        picked_suggestions = avail_out.get("suggestions", []) or avail_out.get("available", [])[:3]
+
+base = {
+    "ok": True,
+    "intent": "schedule",
+    "provider": provider,
+    "customerId": customer_id,
+    "actionTaken": "suggested" if avail_out.get("availableCount", 0) > 0 else "none",
+    "message": "Here are the best available times." if avail_out.get("availableCount", 0) > 0 else "I could not find any available times.",
+    "needsUserChoice": avail_out.get("availableCount", 0) > 0,
+    "needsMoreInfo": avail_out.get("availableCount", 0) == 0,
+    "booked": False,
+    "cancelled": False,
+    "rescheduled": False,
+    "matches": [],
+    "results": [],
+    "suggestions": picked_suggestions,
+    "available": avail_out.get("available", []),
+    "event": None,
+}
         base["assistantResponse"] = build_assistant_response(
             intent="schedule",
             action_taken=base["actionTaken"],
