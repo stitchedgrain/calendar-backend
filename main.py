@@ -3118,48 +3118,80 @@ async def schedule(request: Request, payload: Dict[str, Any]):
         return base
 
     if intent == "cancel":
-        out = cancel_events_handler(
-            provider,
-            request,
-            {
-                "customerId": customer_id,
-                "items": payload.get("items") or [],
-            },
-        )
-        success = any(x.get("cancelled") for x in out.get("results", []))
-
-        base = {
-            "ok": True,
-            "intent": "cancel",
-            "provider": provider,
+    out = cancel_events_handler(
+        provider,
+        request,
+        {
             "customerId": customer_id,
-            "actionTaken": "cancelled" if success else "none",
-            "message": "Appointment cancelled successfully." if success else "I could not cancel that appointment.",
-            "needsUserChoice": False,
-            "needsMoreInfo": False,
-            "booked": False,
-            "cancelled": success,
-            "rescheduled": False,
-            "matches": [],
-            "results": out.get("results", []),
-            "suggestions": [],
-            "available": [],
-            "event": None,
-        }
-        base["assistantResponse"] = build_assistant_response(
-            intent="cancel",
-            action_taken=base["actionTaken"],
-            message=base["message"],
-            needs_user_choice=False,
-            needs_more_info=False,
-            booked=False,
-            cancelled=success,
-            rescheduled=False,
-            suggestions=[],
-            matches=[],
-            results=base["results"],
+            "items": payload.get("items") or [],
+        },
+    )
+
+    results = out.get("results", []) or []
+    cancelled_count = sum(1 for x in results if x.get("cancelled"))
+    requested_count = len(payload.get("items") or [])
+    processed_count = len(results)
+
+    full_success = processed_count > 0 and cancelled_count == processed_count
+    partial_success = cancelled_count > 0 and cancelled_count < processed_count
+    no_success = cancelled_count == 0
+
+    if full_success:
+        msg = (
+            "Appointments cancelled successfully."
+            if processed_count > 1
+            else "Appointment cancelled successfully."
         )
-        return base
+        action_taken = "cancelled"
+        cancelled_flag = True
+    elif partial_success:
+        msg = (
+            f"I cancelled {cancelled_count} appointment(s), "
+            f"but {processed_count - cancelled_count} could not be cancelled."
+        )
+        action_taken = "partial_cancel"
+        cancelled_flag = False
+    else:
+        if requested_count > 1:
+            msg = "I could not cancel those appointments."
+        else:
+            msg = "I could not cancel that appointment."
+        action_taken = "none"
+        cancelled_flag = False
+
+    base = {
+        "ok": True,
+        "intent": "cancel",
+        "provider": provider,
+        "customerId": customer_id,
+        "actionTaken": action_taken,
+        "message": msg,
+        "needsUserChoice": False,
+        "needsMoreInfo": False,
+        "booked": False,
+        "cancelled": cancelled_flag,
+        "rescheduled": False,
+        "matches": [],
+        "results": results,
+        "suggestions": [],
+        "available": [],
+        "event": None,
+    }
+
+    base["assistantResponse"] = build_assistant_response(
+        intent="cancel",
+        action_taken=base["actionTaken"],
+        message=base["message"],
+        needs_user_choice=False,
+        needs_more_info=False,
+        booked=False,
+        cancelled=cancelled_flag,
+        rescheduled=False,
+        suggestions=[],
+        matches=[],
+        results=base["results"],
+    )
+    return base
 
     if intent == "reschedule":
         out = reschedule_events_handler(
