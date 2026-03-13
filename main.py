@@ -18,8 +18,6 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-from datetime import timezone
-
 
 app = FastAPI(title="Calendar Backend", version="4.1.0")
 
@@ -2779,12 +2777,14 @@ def reschedule_events_handler(provider: str, request: Request, payload: Dict[str
         new_local_date = new_start.astimezone(local_tz).date().isoformat()
         closed_dates = combined_closed_date_set(customer_id, years=[new_start.year, new_end.year])
         if new_local_date in closed_dates:
-            results.append({
-                "eventId": ev_id,
-                "rescheduled": False,
-                "reason": "closed_date",
-                "message": "That business is closed on the requested date. Please pick another day.",
-            })
+            results.append(
+                {
+                    "eventId": ev_id,
+                    "rescheduled": False,
+                    "reason": "closed_date",
+                    "message": "That business is closed on the requested date. Please pick another day.",
+                }
+            )
             continue
 
         time_min = new_start - timedelta(minutes=1)
@@ -2793,7 +2793,9 @@ def reschedule_events_handler(provider: str, request: Request, payload: Dict[str
         busy_merged = collect_busy_utc_excluding_event(
             provider=provider,
             access_token=access_token,
-            calendar_ids=([cal_id] + calendars_to_check) if (provider == PROVIDER_GOOGLE and cal_id and cal_id not in calendars_to_check) else calendars_to_check,
+            calendar_ids=([cal_id] + calendars_to_check)
+            if (provider == PROVIDER_GOOGLE and cal_id and cal_id not in calendars_to_check)
+            else calendars_to_check,
             time_min_utc=time_min,
             time_max_utc=time_max,
             exclude_calendar_id=cal_id if provider == PROVIDER_GOOGLE else None,
@@ -2811,7 +2813,14 @@ def reschedule_events_handler(provider: str, request: Request, payload: Dict[str
 
         taken = any(overlaps(new_start, new_end, bs, be) for bs, be in busy_merged)
         if taken:
-            results.append({"eventId": ev_id, "rescheduled": False, "reason": "slot_taken", "message": "That time is already booked. Please pick another slot."})
+            results.append(
+                {
+                    "eventId": ev_id,
+                    "rescheduled": False,
+                    "reason": "slot_taken",
+                    "message": "That time is already booked. Please pick another slot.",
+                }
+            )
             continue
 
         patched = provider_patch_event_time(
@@ -2836,21 +2845,12 @@ def reschedule_events_handler(provider: str, request: Request, payload: Dict[str
         results.append(row)
 
     return {"ok": True, "provider": provider, "requested": len(items), "processed": len(results), "results": results}
-    def _friendly_local_label(local_str: str) -> str:
-    """
-    Turns strings like:
-      'Fri Mar 13, 2026 10:00 AM MDT'
-    into something a bit more Vapi-friendly while still deterministic.
 
-    If parsing fails, returns the original local string.
-    """
+
+def _friendly_local_label(local_str: str) -> str:
     if not local_str:
         return ""
-
-    # Keep it simple and safe. Your backend already produces readable startLocal/endLocal.
-    # Vapi can speak these directly if needed.
     return local_str
-
 
 
 def _build_vapi_options_from_suggestions(suggestions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2868,7 +2868,6 @@ def _build_vapi_options_from_suggestions(suggestions: List[Dict[str, Any]]) -> L
             }
         )
     return out
-
 
 
 def _build_vapi_appointments_from_matches(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2891,7 +2890,6 @@ def _build_vapi_appointments_from_matches(matches: List[Dict[str, Any]]) -> List
     return out
 
 
-
 def _build_message_for_options(options: List[Dict[str, Any]]) -> str:
     if not options:
         return "I could not find any available times."
@@ -2909,7 +2907,6 @@ def _build_message_for_options(options: List[Dict[str, Any]]) -> str:
     first = ", ".join(labels[:-1])
     last = labels[-1]
     return f"I found a few available times: {first}, or {last}. Which works best for you?"
-
 
 
 def _build_message_for_matches(appts: List[Dict[str, Any]]) -> str:
@@ -2938,16 +2935,13 @@ def _build_message_for_matches(appts: List[Dict[str, Any]]) -> str:
     return f"I found multiple appointments: {joined}. Which one would you like?"
 
 
-
 def _extract_first_result_time(results: List[Dict[str, Any]]) -> Dict[str, str]:
     for r in results:
         if not isinstance(r, dict):
             continue
 
-        # Reschedule success sometimes returns nested event payload instead of top-level start/end.
         event = r.get("event") or {}
         if isinstance(event, dict):
-            # Google-like shape
             estart = ((event.get("start") or {}).get("dateTime") or "").strip() if isinstance(event.get("start"), dict) else ""
             eend = ((event.get("end") or {}).get("dateTime") or "").strip() if isinstance(event.get("end"), dict) else ""
             if estart or eend:
@@ -2959,7 +2953,6 @@ def _extract_first_result_time(results: List[Dict[str, Any]]) -> Dict[str, str]:
             return {"startUtc": start_utc, "endUtc": end_utc}
 
     return {"startUtc": "", "endUtc": ""}
-
 
 
 def build_assistant_response(
@@ -3388,294 +3381,3 @@ async def schedule(request: Request, payload: Dict[str, Any]):
         return base
 
     raise HTTPException(status_code=400, detail="Unsupported intent")
-
-
-# =============================================================================
-# Holiday / blackout endpoints
-# =============================================================================
-@app.get("/customers/{customer_id}/blackout_dates")
-def get_blackout_dates(request: Request, customer_id: str):
-    require_api_key(request)
-    return {
-        "ok": True,
-        "customerId": customer_id,
-        "blackoutDates": list_blackout_dates(customer_id),
-    }
-
-
-@app.post("/customers/{customer_id}/blackout_dates")
-async def add_blackout_dates(request: Request, customer_id: str, payload: Dict[str, Any]):
-    require_api_key(request)
-    items = payload.get("items") or []
-    out = upsert_blackout_dates(customer_id, items)
-    return {
-        "ok": True,
-        "customerId": customer_id,
-        "blackoutDates": out,
-    }
-
-
-@app.delete("/customers/{customer_id}/blackout_dates")
-async def remove_blackout_dates(request: Request, customer_id: str, payload: Dict[str, Any]):
-    require_api_key(request)
-    dates = payload.get("dates") or []
-    out = delete_blackout_dates(customer_id, dates)
-    return {
-        "ok": True,
-        "customerId": customer_id,
-        "blackoutDates": out,
-    }
-
-
-@app.get("/customers/{customer_id}/holiday_calendars")
-def get_holiday_calendars(request: Request, customer_id: str):
-    require_api_key(request)
-    return {
-        "ok": True,
-        "customerId": customer_id,
-        "holidayCalendars": load_holiday_calendars(customer_id),
-    }
-
-
-@app.post("/customers/{customer_id}/holiday_calendars")
-async def set_holiday_calendars(request: Request, customer_id: str, payload: Dict[str, Any]):
-    require_api_key(request)
-    out = save_holiday_calendars(customer_id, payload)
-    return {
-        "ok": True,
-        "customerId": customer_id,
-        "holidayCalendars": out,
-    }
-
-
-# =============================================================================
-# Health / debug
-# =============================================================================
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-
-@app.get("/debug/db")
-def debug_db(request: Request):
-    require_debug_key(request)
-    with engine.begin() as conn:
-        v = conn.execute(text("SELECT 1")).scalar_one()
-    return {"db_ok": True, "select_1": v}
-
-
-@app.get("/debug/schema")
-def debug_schema(request: Request):
-    require_debug_key(request)
-    out: Dict[str, Any] = {"tables": []}
-    with engine.begin() as conn:
-        tables = conn.execute(
-            text("""
-                SELECT table_name
-                FROM information_schema.tables
-                WHERE table_schema='public'
-                ORDER BY table_name
-            """)
-        ).fetchall()
-        out["tables"] = [t[0] for t in tables]
-
-        for tname in out["tables"]:
-            cols = conn.execute(
-                text("""
-                    SELECT column_name AS name, data_type AS type
-                    FROM information_schema.columns
-                    WHERE table_schema='public' AND table_name=:t
-                    ORDER BY ordinal_position
-                """),
-                {"t": tname},
-            ).fetchall()
-            out[tname] = [{"name": c[0], "type": c[1]} for c in cols]
-    return out
-
-
-# =============================================================================
-# Generic provider routes
-# =============================================================================
-@app.get("/oauth/{provider}/start")
-def oauth_start(provider: str, customerId: str = Query(...)):
-    return oauth_start_handler(provider, customerId)
-
-
-@app.get("/oauth/{provider}/callback")
-def oauth_callback(provider: str, code: str = "", state: str = "", error: str = ""):
-    provider = validate_provider(provider)
-    return oauth_callback_handler(code, state, error)
-
-
-@app.get("/{provider}/calendars")
-def calendars(provider: str, request: Request, customerId: str):
-    return calendars_handler(provider, request, customerId)
-
-
-@app.post("/{provider}/calendars/select")
-async def calendars_select(provider: str, request: Request, payload: Dict[str, Any]):
-    return calendars_select_handler(provider, request, payload)
-
-
-@app.post("/{provider}/settings")
-async def provider_settings(provider: str, request: Request, payload: Dict[str, Any]):
-    validate_provider(provider)
-    return settings_handler(request, payload)
-
-
-@app.post("/{provider}/freebusy")
-async def freebusy(provider: str, request: Request, payload: Dict[str, Any]):
-    return freebusy_handler(provider, request, payload)
-
-
-@app.post("/{provider}/check_availability")
-async def check_availability(provider: str, request: Request, payload: Dict[str, Any]):
-    return check_availability_handler(provider, request, payload)
-
-
-@app.post("/{provider}/availability")
-async def availability(provider: str, request: Request, payload: Dict[str, Any]):
-    return availability_handler(provider, request, payload)
-
-
-@app.post("/{provider}/create_event")
-async def create_event(provider: str, request: Request, payload: Dict[str, Any]):
-    return create_event_handler(provider, request, payload)
-
-
-@app.post("/{provider}/search_events")
-async def search_events(provider: str, request: Request, payload: Dict[str, Any]):
-    return search_events_handler(provider, request, payload)
-
-
-@app.post("/{provider}/cancel_events")
-async def cancel_events(provider: str, request: Request, payload: Dict[str, Any]):
-    return cancel_events_handler(provider, request, payload)
-
-
-@app.post("/{provider}/reschedule_events")
-async def reschedule_events(provider: str, request: Request, payload: Dict[str, Any]):
-    return reschedule_events_handler(provider, request, payload)
-
-
-# =============================================================================
-# Wrapper routes
-# =============================================================================
-@app.get("/oauth/google/start")
-def oauth_google_start(customerId: str = Query(...)):
-    return oauth_start_handler(PROVIDER_GOOGLE, customerId)
-
-
-@app.get("/oauth/google/callback")
-def oauth_google_callback(code: str = "", state: str = "", error: str = ""):
-    return oauth_callback_handler(code, state, error)
-
-
-@app.get("/oauth/microsoft/start")
-def oauth_microsoft_start(customerId: str = Query(...)):
-    return oauth_start_handler(PROVIDER_MICROSOFT, customerId)
-
-
-@app.get("/oauth/microsoft/callback")
-def oauth_microsoft_callback(code: str = "", state: str = "", error: str = ""):
-    return oauth_callback_handler(code, state, error)
-
-
-@app.get("/google/calendars")
-def google_calendars(request: Request, customerId: str):
-    return calendars_handler(PROVIDER_GOOGLE, request, customerId)
-
-
-@app.post("/google/calendars/select")
-async def google_calendars_select(request: Request, payload: Dict[str, Any]):
-    return calendars_select_handler(PROVIDER_GOOGLE, request, payload)
-
-
-@app.post("/google/settings")
-async def google_settings(request: Request, payload: Dict[str, Any]):
-    return settings_handler(request, payload)
-
-
-@app.post("/google/freebusy")
-async def google_freebusy(request: Request, payload: Dict[str, Any]):
-    return freebusy_handler(PROVIDER_GOOGLE, request, payload)
-
-
-@app.post("/google/check_availability")
-async def google_check_availability(request: Request, payload: Dict[str, Any]):
-    return check_availability_handler(PROVIDER_GOOGLE, request, payload)
-
-
-@app.post("/google/availability")
-async def google_availability(request: Request, payload: Dict[str, Any]):
-    return availability_handler(PROVIDER_GOOGLE, request, payload)
-
-
-@app.post("/google/create_event")
-async def google_create_event(request: Request, payload: Dict[str, Any]):
-    return create_event_handler(PROVIDER_GOOGLE, request, payload)
-
-
-@app.post("/google/search_events")
-async def google_search_events(request: Request, payload: Dict[str, Any]):
-    return search_events_handler(PROVIDER_GOOGLE, request, payload)
-
-
-@app.post("/google/cancel_events")
-async def google_cancel_events(request: Request, payload: Dict[str, Any]):
-    return cancel_events_handler(PROVIDER_GOOGLE, request, payload)
-
-
-@app.post("/google/reschedule_events")
-async def google_reschedule_events(request: Request, payload: Dict[str, Any]):
-    return reschedule_events_handler(PROVIDER_GOOGLE, request, payload)
-
-
-@app.get("/microsoft/calendars")
-def microsoft_calendars(request: Request, customerId: str):
-    return calendars_handler(PROVIDER_MICROSOFT, request, customerId)
-
-
-@app.post("/microsoft/calendars/select")
-async def microsoft_calendars_select(request: Request, payload: Dict[str, Any]):
-    return calendars_select_handler(PROVIDER_MICROSOFT, request, payload)
-
-
-@app.post("/microsoft/settings")
-async def microsoft_settings(request: Request, payload: Dict[str, Any]):
-    return settings_handler(request, payload)
-
-
-@app.post("/microsoft/freebusy")
-async def microsoft_freebusy(request: Request, payload: Dict[str, Any]):
-    return freebusy_handler(PROVIDER_MICROSOFT, request, payload)
-
-
-@app.post("/microsoft/check_availability")
-async def microsoft_check_availability(request: Request, payload: Dict[str, Any]):
-    return check_availability_handler(PROVIDER_MICROSOFT, request, payload)
-
-
-@app.post("/microsoft/availability")
-async def microsoft_availability(request: Request, payload: Dict[str, Any]):
-    return availability_handler(PROVIDER_MICROSOFT, request, payload)
-
-
-@app.post("/microsoft/create_event")
-async def microsoft_create_event(request: Request, payload: Dict[str, Any]):
-    return create_event_handler(PROVIDER_MICROSOFT, request, payload)
-
-
-@app.post("/microsoft/search_events")
-async def microsoft_search_events(request: Request, payload: Dict[str, Any]):
-    return search_events_handler(PROVIDER_MICROSOFT, request, payload)
-
-
-@app.post("/microsoft/cancel_events")
-async def microsoft_cancel_events(request: Request, payload: Dict[str, Any]):
-    return cancel_events_handler(PROVIDER_MICROSOFT, request, payload)
-
-
-@app.post("/microsoft/reschedule_events")
-async def microsoft_reschedule_events(request: Request, payload: Dict[str, Any]):
-    return reschedule_events_handler(PROVIDER_MICROSOFT, request, payload)
