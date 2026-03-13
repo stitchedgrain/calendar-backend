@@ -3199,10 +3199,14 @@ async def schedule(request: Request, payload: Dict[str, Any]):
             matches=[],
             results=base["results"],
         )
+                )
         return base
 
-        if intent == "schedule":
-        has_exact = bool((payload.get("startUtc") or "").strip() and (payload.get("endUtc") or "").strip())
+    if intent == "schedule":
+        has_exact = bool(
+            (payload.get("startUtc") or "").strip() and
+            (payload.get("endUtc") or "").strip()
+        )
 
         if has_exact:
             check_payload = {
