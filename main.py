@@ -437,8 +437,11 @@ def pick_by_preference(
     max_results = int(pref.get("maxResults", 3))
 
     wanted_weekday = None
-    if str(pref.get("type", "")).lower() == "weekday":
-        wanted_weekday = weekday_name_to_int(str(pref.get("weekday", "")))
+weekday_raw = str(pref.get("weekday", "")).strip()
+pref_type = str(pref.get("type", "")).lower().strip()
+
+if weekday_raw and (pref_type == "weekday" or not pref_type):
+    wanted_weekday = weekday_name_to_int(weekday_raw)
 
     tod = str(pref.get("timeOfDay", "any")).strip().lower()
     if tod not in ("morning", "afternoon", "any"):
