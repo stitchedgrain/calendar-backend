@@ -1555,10 +1555,18 @@ def microsoft_create_event_api(
     return {"statusCode": r.status_code, "json": safe_json(r), "text": r.text, "requestBody": body}
 
 
-def microsoft_delete_event_api(access_token: str, event_id: str) -> Dict[str, Any]:
-    url = MS_EVENT_URL.format(eventId=safe_event_id(event_id))
+def microsoft_delete_event_api(access_token: str, calendar_id: str, event_id: str) -> Dict[str, Any]:
+    url = MS_CALENDAR_EVENT_URL.format(
+        calendarId=safe_cal_id(calendar_id),
+        eventId=safe_event_id(event_id)
+    )
+
     r = requests.delete(url, headers=_graph_headers(access_token), timeout=30)
-    return {"statusCode": r.status_code, "text": r.text}
+
+    return {
+        "statusCode": r.status_code,
+        "text": r.text
+    }
 
 
 def microsoft_patch_event_time_api(
