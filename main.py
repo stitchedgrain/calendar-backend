@@ -3276,59 +3276,7 @@ async def schedule(request: Request, payload: Dict[str, Any]):
         )
         return base
 
-    if intent == "schedule":
-        has_exact = bool((payload.get("startUtc") or "").strip() and (payload.get("endUtc") or "").strip())
-
-        if has_exact:
-            check_payload = {
-                "customerId": customer_id,
-                "timeZone": payload.get("timeZone") or "America/Denver",
-                "startUtc": payload.get("startUtc"),
-                "endUtc": payload.get("endUtc"),
-                "durationMinutes": payload.get("durationMinutes", 60),
-                "stepMinutes": payload.get("stepMinutes", 30),
-                "days": payload.get("days", 7),
-                "calendarIds": payload.get("calendarIds") or [],
-                "preference": payload.get("preference") or {},
-            }
-            check_out = check_availability_handler(provider, request, check_payload)
-
-            if not check_out.get("isFree"):
-                suggestions = check_out.get("suggestions", [])
-                base = {
-                    "ok": True,
-                    "intent": "schedule",
-                    "provider": provider,
-                    "customerId": customer_id,
-                    "actionTaken": "suggested",
-                    "message": "Sorry, that time is taken. Here are some other available times.",
-                    "needsUserChoice": True,
-                    "needsMoreInfo": False,
-                    "booked": False,
-                    "cancelled": False,
-                    "rescheduled": False,
-                    "matches": [],
-                    "results": [],
-                    "suggestions": suggestions,
-                    "available": check_out.get("available", []),
-                    "event": None,
-                }
-                base["assistantResponse"] = build_assistant_response(
-                    intent="schedule",
-                    action_taken="suggested",
-                    message=base["message"],
-                    needs_user_choice=True,
-                    needs_more_info=False,
-                    booked=False,
-                    cancelled=False,
-                    rescheduled=False,
-                    suggestions=suggestions,
-                    matches=[],
-                    results=[],
-                )
-                return base
-
-            hold = create_slot_hold(
+                hold = create_slot_hold(
                 provider=provider,
                 customer_id=customer_id,
                 calendar_id=(payload.get("calendarId") or ""),
@@ -3337,23 +3285,97 @@ async def schedule(request: Request, payload: Dict[str, Any]):
                 ttl_seconds=int(payload.get("ttlSeconds", 300)),
             )
 
-            create_payload = {
-                "customerId": customer_id,
-                "timeZone": payload.get("timeZone") or "America/Denver",
-                "calendarId": payload.get("calendarId") or "",
-                "summary": payload.get("summary") or "Appointment",
-                "description": payload.get("description") or "",
-                "attendees": payload.get("attendees") or [],
-                "start": {"dateTime": payload.get("startUtc")},
-                "end": {"dateTime": payload.get("endUtc")},
-            }
+            try:
+                create_payload = {
+                    "customerId": customer_id,
+                    "timeZone": payload.get("timeZone") or "America/Denver",
+                    "calendarId": payload.get("calendarId") or "",
+                    "summary": payload.get("summary") or "Appointment",
+                    "description": payload.get("description") or "",
+                    "attendees": payload.get("attendees") or [],
+                    "start": {"dateTime": payload.get("startUtc")},
+                    "end": {"dateTime": payload.get("endUtc")},
+                }
 
-            create_out = create_event_handler(
-    provider,
-    request,
-    create_payload,
-    exclude_hold_token=hold["holdToken"],
-)
+                create_out = create_event_handler(
+                    provider,
+                    request,
+                    create_payload,
+                    exclude_hold_token=hold["holdToken"],
+                )
+            finally:
+                release_slot_hold(hold["holdToken"])
+
+            if create_out.get("booked"):
+                base = {
+                    "ok": True,
+                    "intent": "schedule",
+                    "provider": provider,
+                    "customerId": customer_id,
+                    "actionTaken": "booked",
+                    "message": "Appointment booked successfully.",
+                    "needsUserChoice": False,
+                    "needsMoreInfo": False,
+                    "booked": True,
+                    "cancelled": False,
+                    "rescheduled": False,
+                    "hold": hold,
+                    "matches": [],
+                    "results": [],
+                    "suggestions": [],
+                    "available": [],
+                    "event": create_out.get("event"),
+                }
+                base["assistantResponse"] = build_assistant_response(
+                    intent="schedule",
+                    action_taken="booked",
+                    message=base["message"],
+                    needs_user_choice=False,
+                    needs_more_info=False,
+                    booked=True,
+                    cancelled=False,
+                    rescheduled=False,
+                    suggestions=[],
+                    matches=[],
+                    results=[],
+                    start_utc=(payload.get("startUtc") or "").strip(),
+                    end_utc=(payload.get("endUtc") or "").strip(),
+                )
+                return base
+
+            base = {
+                "ok": True,
+                "intent": "schedule",
+                "provider": provider,
+                "customerId": customer_id,
+                "actionTaken": "none",
+                "message": create_out.get("message") or "I could not book that appointment.",
+                "needsUserChoice": False,
+                "needsMoreInfo": False,
+                "booked": False,
+                "cancelled": False,
+                "rescheduled": False,
+                "hold": hold,
+                "matches": [],
+                "results": [],
+                "suggestions": [],
+                "available": [],
+                "event": None,
+            }
+            base["assistantResponse"] = build_assistant_response(
+                intent="schedule",
+                action_taken="none",
+                message=base["message"],
+                needs_user_choice=False,
+                needs_more_info=False,
+                booked=False,
+                cancelled=False,
+                rescheduled=False,
+                suggestions=[],
+                matches=[],
+                results=[],
+            )
+            return base
             release_slot_hold(hold["holdToken"])
 
             if create_out.get("booked"):
