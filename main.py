@@ -2838,6 +2838,199 @@ def reschedule_events_handler(provider: str, request: Request, payload: Dict[str
         results.append(row)
 
     return {"ok": True, "provider": provider, "requested": len(items), "processed": len(results), "results": results}
+    def _friendly_local_label(local_str: str) -> str:
+    """
+    Turns strings like:
+      'Fri Mar 13, 2026 10:00 AM MDT'
+    into something a bit more Vapi-friendly while still deterministic.
+
+    If parsing fails, returns the original local string.
+    """
+    if not local_str:
+        return ""
+
+    # Keep it simple and safe. Your backend already produces readable startLocal/endLocal.
+    # Vapi can speak these directly if needed.
+    return local_str
+
+
+
+def _build_vapi_options_from_suggestions(suggestions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for s in suggestions[:3]:
+        if not isinstance(s, dict):
+            continue
+        out.append(
+            {
+                "label": _friendly_local_label((s.get("startLocal") or "").strip()),
+                "startUtc": (s.get("startUtc") or "").strip(),
+                "endUtc": (s.get("endUtc") or "").strip(),
+                "startLocal": (s.get("startLocal") or "").strip(),
+                "endLocal": (s.get("endLocal") or "").strip(),
+            }
+        )
+    return out
+
+
+
+def _build_vapi_appointments_from_matches(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for m in matches:
+        if not isinstance(m, dict):
+            continue
+        out.append(
+            {
+                "label": _friendly_local_label((m.get("startLocal") or "").strip()),
+                "eventId": (m.get("eventId") or "").strip(),
+                "calendarId": (m.get("calendarId") or "").strip(),
+                "summary": (m.get("summary") or "").strip(),
+                "startUtc": (m.get("startUtc") or "").strip(),
+                "endUtc": (m.get("endUtc") or "").strip(),
+                "startLocal": (m.get("startLocal") or "").strip(),
+                "endLocal": (m.get("endLocal") or "").strip(),
+            }
+        )
+    return out
+
+
+
+def _build_message_for_options(options: List[Dict[str, Any]]) -> str:
+    if not options:
+        return "I could not find any available times."
+
+    labels = [x.get("label", "") for x in options if x.get("label")]
+    if not labels:
+        return "I found a few available times. Which one works best for you?"
+
+    if len(labels) == 1:
+        return f"I found one available time: {labels[0]}. Does that work for you?"
+
+    if len(labels) == 2:
+        return f"I found two available times: {labels[0]} or {labels[1]}. Which works best for you?"
+
+    first = ", ".join(labels[:-1])
+    last = labels[-1]
+    return f"I found a few available times: {first}, or {last}. Which works best for you?"
+
+
+
+def _build_message_for_matches(appts: List[Dict[str, Any]]) -> str:
+    if not appts:
+        return "I could not find any matching appointments."
+
+    if len(appts) == 1:
+        a = appts[0]
+        summary = (a.get("summary") or "appointment").strip()
+        label = (a.get("label") or "").strip()
+        if label:
+            return f"I found one {summary} on {label}. Is that the appointment you mean?"
+        return f"I found one {summary}. Is that the appointment you mean?"
+
+    labels = []
+    for a in appts[:3]:
+        summary = (a.get("summary") or "appointment").strip()
+        label = (a.get("label") or "").strip()
+        labels.append(f"{summary} on {label}" if label else summary)
+
+    if len(labels) == 2:
+        joined = f"{labels[0]} or {labels[1]}"
+    else:
+        joined = ", ".join(labels[:-1]) + f", or {labels[-1]}"
+
+    return f"I found multiple appointments: {joined}. Which one would you like?"
+
+
+
+def _extract_first_result_time(results: List[Dict[str, Any]]) -> Dict[str, str]:
+    for r in results:
+        if not isinstance(r, dict):
+            continue
+
+        # Reschedule success sometimes returns nested event payload instead of top-level start/end.
+        event = r.get("event") or {}
+        if isinstance(event, dict):
+            # Google-like shape
+            estart = ((event.get("start") or {}).get("dateTime") or "").strip() if isinstance(event.get("start"), dict) else ""
+            eend = ((event.get("end") or {}).get("dateTime") or "").strip() if isinstance(event.get("end"), dict) else ""
+            if estart or eend:
+                return {"startUtc": estart, "endUtc": eend}
+
+        start_utc = (r.get("startUtc") or "").strip()
+        end_utc = (r.get("endUtc") or "").strip()
+        if start_utc or end_utc:
+            return {"startUtc": start_utc, "endUtc": end_utc}
+
+    return {"startUtc": "", "endUtc": ""}
+
+
+
+def build_assistant_response(
+    *,
+    intent: str,
+    action_taken: str,
+    message: str,
+    needs_user_choice: bool,
+    needs_more_info: bool,
+    booked: bool,
+    cancelled: bool,
+    rescheduled: bool,
+    suggestions: Optional[List[Dict[str, Any]]] = None,
+    matches: Optional[List[Dict[str, Any]]] = None,
+    results: Optional[List[Dict[str, Any]]] = None,
+    start_utc: str = "",
+    end_utc: str = "",
+) -> Dict[str, Any]:
+    suggestions = suggestions or []
+    matches = matches or []
+    results = results or []
+
+    options = _build_vapi_options_from_suggestions(suggestions)
+    appointments = _build_vapi_appointments_from_matches(matches)
+
+    status = "error"
+    vapi_message = message or "I ran into a problem."
+
+    if booked:
+        status = "booked"
+        vapi_message = message or "Your appointment is confirmed."
+    elif cancelled:
+        status = "cancelled"
+        vapi_message = message or "Your appointment has been cancelled."
+    elif rescheduled:
+        status = "rescheduled"
+        vapi_message = message or "Your appointment has been rescheduled."
+    elif appointments:
+        status = "matches"
+        vapi_message = _build_message_for_matches(appointments)
+    elif options:
+        status = "options"
+        vapi_message = _build_message_for_options(options)
+    elif needs_more_info:
+        status = "needs_info"
+        vapi_message = message or "I need a little more information to continue."
+    elif action_taken == "none":
+        status = "none"
+        vapi_message = message or "I could not complete that request."
+
+    if not start_utc and not end_utc:
+        picked = _extract_first_result_time(results)
+        start_utc = picked.get("startUtc", "")
+        end_utc = picked.get("endUtc", "")
+
+    return {
+        "status": status,
+        "message": vapi_message,
+        "needsUserChoice": bool(needs_user_choice),
+        "needsMoreInfo": bool(needs_more_info),
+        "selectedAction": intent,
+        "options": options,
+        "appointments": appointments,
+        "bookingConfirmed": bool(booked),
+        "cancellationConfirmed": bool(cancelled),
+        "rescheduleConfirmed": bool(rescheduled),
+        "startUtc": start_utc or "",
+        "endUtc": end_utc or "",
+    }
 
 
 # =============================================================================
