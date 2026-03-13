@@ -17,7 +17,6 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
-from __future__ import annotations
 
 from datetime import timezone
 from typing import Any, Dict, List, Optional
