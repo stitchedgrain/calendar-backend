@@ -2587,6 +2587,87 @@ def create_event_handler(
         time_min_utc=time_min,
         time_max_utc=time_max,
         customer_id=customer_id,
+        exclude_hold_token=exclude_hold_token,
+    )
+    merged_busy = [
+        (parse_iso_to_utc(x["startUtc"]), parse_iso_to_utc(x["endUtc"]))
+        for x in busy_pack["busyMerged"]
+    ]
+    merged_busy = merge_intervals_dt(merged_busy)
+
+    for bs, be in merged_busy:
+        if overlaps(start_utc, end_utc, bs, be):
+            return {
+                "booked": False,
+                "reason": "slot_taken",
+                "message": "That time is already booked. Please pick another slot.",
+                "checkedCalendars": calendars_to_check,
+                "busyMerged": [{"startUtc": iso_z(bs), "endUtc": iso_z(be)} for bs, be in merged_busy],
+            }
+
+    created = provider_create_event(
+        provider=provider,
+        access_token=access_token,
+        calendar_id=calendar_id,
+        summary=summary,
+        description=description,
+        start_utc=start_utc,
+        end_utc=end_utc,
+        tz_name=tz_name,
+        attendees=attendees,
+    )
+    if created["statusCode"] not in (200, 201):
+        return {
+            "booked": False,
+            "reason": f"{provider}_create_failed",
+            "message": f"{provider.capitalize()} rejected the create event request",
+            "statusCode": created["statusCode"],
+            "providerResponseText": created["text"],
+            "requestBody": created["requestBody"],
+        }
+
+    return {
+        "booked": True,
+        "provider": provider,
+        "calendarId": calendar_id,
+        "event": created.get("json"),
+        "startUtc": iso_z(start_utc),
+        "endUtc": iso_z(end_utc),
+    }
+
+    if end_utc <= start_utc:
+        return {"booked": False, "reason": "invalid_range", "message": "end must be after start"}
+
+    local_tz = zoneinfo_from_any_tz(tz_name, fallback="UTC")
+    start_local_date = start_utc.astimezone(local_tz).date().isoformat()
+    closed_dates = combined_closed_date_set(customer_id, years=[start_utc.year, end_utc.year])
+
+    if start_local_date in closed_dates:
+        return {
+            "booked": False,
+            "reason": "closed_date",
+            "message": "That business is closed on the requested date. Please pick another day.",
+        }
+
+    rt = load_refresh_token(provider, customer_id)
+    access_token = refresh_access_token(provider, rt)
+
+    calendars_to_check = selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider))
+    calendars_to_check = [c for c in calendars_to_check if c]
+    if calendar_id not in calendars_to_check:
+        calendars_to_check = [calendar_id] + calendars_to_check
+
+    time_min = start_utc - timedelta(minutes=1)
+    time_max = end_utc + timedelta(minutes=1)
+
+    busy_pack = collect_busy_utc(
+        provider=provider,
+        access_token=access_token,
+        tz_name=tz_name,
+        calendar_ids=calendars_to_check,
+        time_min_utc=time_min,
+        time_max_utc=time_max,
+        customer_id=customer_id,
     )
     merged_busy = [(parse_iso_to_utc(x["startUtc"]), parse_iso_to_utc(x["endUtc"])) for x in busy_pack["busyMerged"]]
     merged_busy = merge_intervals_dt(merged_busy)
