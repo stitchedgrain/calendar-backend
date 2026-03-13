@@ -3128,7 +3128,7 @@ async def schedule(request: Request, payload: Dict[str, Any]):
         )
         return base
 
-        if intent == "cancel":
+    if intent == "cancel":
         out = cancel_events_handler(
             provider,
             request,
@@ -3198,6 +3198,61 @@ async def schedule(request: Request, payload: Dict[str, Any]):
             booked=False,
             cancelled=cancelled_flag,
             rescheduled=False,
+            suggestions=[],
+            matches=[],
+            results=base["results"],
+        )
+        return base
+
+    if intent == "reschedule":
+        out = reschedule_events_handler(
+            provider,
+            request,
+            {
+                "customerId": customer_id,
+                "timeZone": payload.get("timeZone") or "America/Denver",
+                "items": payload.get("items") or [],
+            },
+        )
+        success = any(x.get("rescheduled") for x in out.get("results", []))
+        slot_taken = any(x.get("reason") == "slot_taken" for x in out.get("results", []))
+        closed_date = any(x.get("reason") == "closed_date" for x in out.get("results", []))
+
+        msg = "Appointment rescheduled successfully."
+        if slot_taken:
+            msg = "Sorry, that time is taken. Please pick a different time."
+        elif closed_date:
+            msg = "That business is closed on the requested date. Please pick another day."
+        elif not success:
+            msg = "I could not reschedule that appointment."
+
+        base = {
+            "ok": True,
+            "intent": "reschedule",
+            "provider": provider,
+            "customerId": customer_id,
+            "actionTaken": "rescheduled" if success else "none",
+            "message": msg,
+            "needsUserChoice": False,
+            "needsMoreInfo": False,
+            "booked": False,
+            "cancelled": False,
+            "rescheduled": success,
+            "matches": [],
+            "results": out.get("results", []),
+            "suggestions": [],
+            "available": [],
+            "event": None,
+        }
+        base["assistantResponse"] = build_assistant_response(
+            intent="reschedule",
+            action_taken=base["actionTaken"],
+            message=base["message"],
+            needs_user_choice=False,
+            needs_more_info=False,
+            booked=False,
+            cancelled=False,
+            rescheduled=success,
             suggestions=[],
             matches=[],
             results=base["results"],
