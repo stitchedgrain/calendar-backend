@@ -3054,8 +3054,16 @@ async def schedule(request: Request, payload: Dict[str, Any]):
         search_payload = {
             "customerId": customer_id,
             "timeZone": payload.get("timeZone") or "America/Denver",
-            "email": ((payload.get("search") or {}).get("email") if isinstance(payload.get("search"), dict) else "") or payload.get("email") or "",
-            "phone": ((payload.get("search") or {}).get("phone") if isinstance(payload.get("search"), dict) else "") or payload.get("phone") or "",
+            "email": (
+                ((payload.get("search") or {}).get("email"))
+                if isinstance(payload.get("search"), dict)
+                else ""
+            ) or payload.get("email") or "",
+            "phone": (
+                ((payload.get("search") or {}).get("phone"))
+                if isinstance(payload.get("search"), dict)
+                else ""
+            ) or payload.get("phone") or "",
             "timeMinUtc": payload.get("timeMinUtc") or "",
             "timeMaxUtc": payload.get("timeMaxUtc") or "",
             "calendarIds": payload.get("calendarIds") or [],
@@ -3199,13 +3207,12 @@ async def schedule(request: Request, payload: Dict[str, Any]):
             matches=[],
             results=base["results"],
         )
-                )
         return base
 
     if intent == "schedule":
         has_exact = bool(
-            (payload.get("startUtc") or "").strip() and
-            (payload.get("endUtc") or "").strip()
+            (payload.get("startUtc") or "").strip()
+            and (payload.get("endUtc") or "").strip()
         )
 
         if has_exact:
@@ -3378,7 +3385,9 @@ async def schedule(request: Request, payload: Dict[str, Any]):
             "provider": provider,
             "customerId": customer_id,
             "actionTaken": "suggested" if avail_out.get("availableCount", 0) > 0 else "none",
-            "message": "Here are the best available times." if avail_out.get("availableCount", 0) > 0 else "I could not find any available times.",
+            "message": "Here are the best available times."
+            if avail_out.get("availableCount", 0) > 0
+            else "I could not find any available times.",
             "needsUserChoice": avail_out.get("availableCount", 0) > 0,
             "needsMoreInfo": avail_out.get("availableCount", 0) == 0,
             "booked": False,
@@ -3404,6 +3413,38 @@ async def schedule(request: Request, payload: Dict[str, Any]):
             results=[],
         )
         return base
+
+    return {
+        "ok": False,
+        "intent": intent,
+        "provider": provider,
+        "customerId": customer_id,
+        "actionTaken": "none",
+        "message": "Unsupported intent.",
+        "needsUserChoice": False,
+        "needsMoreInfo": True,
+        "booked": False,
+        "cancelled": False,
+        "rescheduled": False,
+        "matches": [],
+        "results": [],
+        "suggestions": [],
+        "available": [],
+        "event": None,
+        "assistantResponse": build_assistant_response(
+            intent=intent,
+            action_taken="none",
+            message="Unsupported intent.",
+            needs_user_choice=False,
+            needs_more_info=True,
+            booked=False,
+            cancelled=False,
+            rescheduled=False,
+            suggestions=[],
+            matches=[],
+            results=[],
+        ),
+    }
 
 
 # =============================================================================
