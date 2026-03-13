@@ -3386,7 +3386,7 @@ base = {
     "available": avail_out.get("available", []),
     "event": None,
 }
-        base["assistantResponse"] = build_assistant_response(
+base["assistantResponse"] = build_assistant_response(
             intent="schedule",
             action_taken=base["actionTaken"],
             message=base["message"],
