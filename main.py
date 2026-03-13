@@ -82,6 +82,9 @@ MS_CALENDARVIEW_URL = f"{GRAPH_BASE}/me/calendars/{{calendarId}}/calendarView"
 MS_CREATE_EVENT_URL = f"{GRAPH_BASE}/me/calendars/{{calendarId}}/events"
 MS_EVENT_URL = f"{GRAPH_BASE}/me/events/{{eventId}}"
 
+# ADD THIS
+MS_CALENDAR_EVENT_URL = f"{GRAPH_BASE}/me/calendars/{{calendarId}}/events/{{eventId}}"
+
 MS_SCOPES = [
     "offline_access",
     "openid",
