@@ -3129,9 +3129,9 @@ async def schedule(request: Request, payload: Dict[str, Any]):
         return base
 
     if intent == "cancel":
-    out = cancel_events_handler(
-        provider,
-        request,
+        out = cancel_events_handler(
+            provider,
+            request,
         {
             "customerId": customer_id,
             "items": payload.get("items") or [],
