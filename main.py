@@ -3267,7 +3267,12 @@ async def schedule(request: Request, payload: Dict[str, Any]):
                 "end": {"dateTime": payload.get("endUtc")},
             }
 
-            create_out = create_event_handler(provider, request, create_payload)
+            create_out = create_event_handler(
+    provider,
+    request,
+    create_payload,
+    exclude_hold_token=hold["holdToken"],
+)
             release_slot_hold(hold["holdToken"])
 
             if create_out.get("booked"):
