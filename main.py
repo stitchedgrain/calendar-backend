@@ -19,7 +19,6 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 from datetime import timezone
-from typing import Any, Dict, List, Optional
 
 
 app = FastAPI(title="Calendar Backend", version="4.1.0")
