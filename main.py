@@ -437,11 +437,11 @@ def pick_by_preference(
     max_results = int(pref.get("maxResults", 3))
 
     wanted_weekday = None
-weekday_raw = str(pref.get("weekday", "")).strip()
-pref_type = str(pref.get("type", "")).lower().strip()
+    weekday_raw = str(pref.get("weekday", "")).strip()
+    pref_type = str(pref.get("type", "")).lower().strip()
 
-if weekday_raw and (pref_type == "weekday" or not pref_type):
-    wanted_weekday = weekday_name_to_int(weekday_raw)
+    if weekday_raw and (pref_type == "weekday" or not pref_type):
+        wanted_weekday = weekday_name_to_int(weekday_raw)
 
     tod = str(pref.get("timeOfDay", "any")).strip().lower()
     if tod not in ("morning", "afternoon", "any"):
@@ -475,7 +475,11 @@ if weekday_raw and (pref_type == "weekday" or not pref_type):
     strategy = str(pref.get("strategy", "soonest")).strip().lower()
 
     if strategy == "closest" and preferred_utc is not None:
-        filtered.sort(key=lambda x: abs((parse_iso_to_utc(x["startUtc"]) - preferred_utc).total_seconds()))
+        filtered.sort(
+            key=lambda x: abs(
+                (parse_iso_to_utc(x["startUtc"]) - preferred_utc).total_seconds()
+            )
+        )
         return filtered[:max_results]
 
     if strategy == "spread":
