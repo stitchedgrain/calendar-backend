@@ -3036,8 +3036,8 @@ def build_assistant_response(
 # =============================================================================
 # Unified schedule endpoint
 # =============================================================================
-# @app.post("/schedule")
-async def schedule(request, payload: Dict[str, Any]):
+@app.post("/schedule")
+async def schedule(request: Request, payload: Dict[str, Any]):
     require_api_key(request)
 
     provider = validate_provider((payload.get("provider") or "").strip().lower())
@@ -3390,95 +3390,6 @@ async def schedule(request, payload: Dict[str, Any]):
         return base
 
     raise HTTPException(status_code=400, detail="Unsupported intent")
-
-# =============================================================================
-# Hold endpoints
-# =============================================================================
-@app.post("/holds/create")
-async def create_hold_endpoint(request: Request, payload: Dict[str, Any]):
-    require_api_key(request)
-
-    provider = validate_provider((payload.get("provider") or "").strip().lower())
-    customer_id = (payload.get("customerId") or "").strip()
-    calendar_id = (payload.get("calendarId") or "").strip()
-    tz_name = (payload.get("timeZone") or "America/Denver").strip()
-    ttl_seconds = int(payload.get("ttlSeconds", 300))
-
-    if not customer_id:
-        raise HTTPException(status_code=400, detail="customerId required")
-
-    try:
-        start_utc = parse_any_datetime_to_utc((payload.get("startUtc") or "").strip(), tz_name)
-        end_utc = parse_any_datetime_to_utc((payload.get("endUtc") or "").strip(), tz_name)
-    except Exception:
-        raise HTTPException(status_code=400, detail="startUtc/endUtc required")
-
-    if end_utc <= start_utc:
-        raise HTTPException(status_code=400, detail="endUtc must be after startUtc")
-
-    rt = load_refresh_token(provider, customer_id)
-    access_token = refresh_access_token(provider, rt)
-
-    cal_ids = payload.get("calendarIds")
-    calendar_ids = cal_ids if isinstance(cal_ids, list) and cal_ids else selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider))
-    calendar_ids = [c for c in calendar_ids if c]
-    if calendar_id and calendar_id not in calendar_ids:
-        calendar_ids = [calendar_id] + calendar_ids
-
-    busy_pack = collect_busy_utc(
-        provider=provider,
-        access_token=access_token,
-        tz_name=tz_name,
-        calendar_ids=calendar_ids,
-        time_min_utc=start_utc - timedelta(minutes=1),
-        time_max_utc=end_utc + timedelta(minutes=1),
-        customer_id=customer_id,
-    )
-
-    merged_busy = [
-        (parse_iso_to_utc(x["startUtc"]), parse_iso_to_utc(x["endUtc"]))
-        for x in busy_pack.get("busyMerged", [])
-    ]
-
-    if any(overlaps(start_utc, end_utc, bs, be) for bs, be in merged_busy):
-        return {
-            "ok": True,
-            "held": False,
-            "reason": "slot_taken",
-            "message": "Sorry, that slot is not available.",
-            "busyMerged": busy_pack.get("busyMerged", []),
-        }
-
-    hold = create_slot_hold(
-        provider=provider,
-        customer_id=customer_id,
-        calendar_id=calendar_id or "",
-        start_utc=start_utc,
-        end_utc=end_utc,
-        ttl_seconds=ttl_seconds,
-    )
-
-    return {
-        "ok": True,
-        "held": True,
-        "message": "Slot hold created.",
-        "hold": hold,
-    }
-
-
-@app.post("/holds/release")
-async def release_hold_endpoint(request: Request, payload: Dict[str, Any]):
-    require_api_key(request)
-    hold_token = (payload.get("holdToken") or "").strip()
-    if not hold_token:
-        raise HTTPException(status_code=400, detail="holdToken required")
-
-    ok = release_slot_hold(hold_token)
-    return {
-        "ok": True,
-        "released": ok,
-        "message": "Hold released." if ok else "Hold was not found or already expired.",
-    }
 
 
 # =============================================================================
