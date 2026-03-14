@@ -34,6 +34,7 @@ DEBUG_API_KEY = (os.environ.get("DEBUG_API_KEY") or "").strip()
 GOOGLE_CLIENT_ID = (os.environ.get("GOOGLE_CLIENT_ID") or "").strip()
 GOOGLE_CLIENT_SECRET = (os.environ.get("GOOGLE_CLIENT_SECRET") or "").strip()
 GOOGLE_REDIRECT_URI = (os.environ.get("GOOGLE_REDIRECT_URI") or "").strip()
+APP_BASE_URL = (os.environ.get("APP_BASE_URL") or "").strip()
 
 # Microsoft
 MS_CLIENT_ID = (os.environ.get("MS_CLIENT_ID") or "").strip()
