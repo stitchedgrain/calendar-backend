@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import calendar as pycalendar
 import json
+import logging
 import os
 import re
 import secrets
@@ -22,11 +23,20 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+
 # =============================================================================
 # HTTP client + rate-limit semaphore
 # =============================================================================
 _http: httpx.AsyncClient
 _api_semaphore = asyncio.Semaphore(5)
+
+
+async def _db(fn, *args, **kwargs):
+    """Run a synchronous DB function in a thread pool to avoid blocking the event loop."""
+    return await asyncio.to_thread(fn, *args, **kwargs)
 
 
 async def _get(url: str, **kwargs) -> httpx.Response:
@@ -2148,7 +2158,7 @@ async def oauth_callback_handler(code: str, state: str, error: str):
     if not code or not state:
         return JSONResponse({"connected": False, "error": "Missing code/state"}, status_code=400)
 
-    state_data = consume_oauth_state(state)
+    state_data = await _db(consume_oauth_state, state)
     if not state_data:
         return JSONResponse({"connected": False, "error": "Invalid/expired state"}, status_code=400)
 
@@ -2157,6 +2167,7 @@ async def oauth_callback_handler(code: str, state: str, error: str):
 
     tok = await exchange_code_for_tokens(provider, code)
     if tok["status"] != 200 or not tok["json"]:
+        logger.error("Token exchange failed for provider=%s customer=%s: %s", provider, customer_id, tok["text"])
         return JSONResponse(
             {"connected": False, "provider": provider, "error": "Token exchange failed", "responseText": tok["text"]},
             status_code=500,
@@ -2175,9 +2186,10 @@ async def oauth_callback_handler(code: str, state: str, error: str):
         )
 
     email = await fetch_user_email(provider, access_token)
-    save_oauth_token(provider, customer_id, email, refresh_token, scope, token_type)
+    await _db(save_oauth_token, provider, customer_id, email, refresh_token, scope, token_type)
+    logger.info("OAuth connected provider=%s customer=%s email=%s", provider, customer_id, email)
 
-    ensure_customer_settings(customer_id)
+    await _db(ensure_customer_settings, customer_id)
     await sync_calendars_from_provider(provider, customer_id, access_token)
 
     return JSONResponse(
@@ -2195,14 +2207,14 @@ async def calendars_handler(provider: str, request: Request, customer_id: str):
     require_api_key(request)
     provider = validate_provider(provider)
 
-    rt = load_refresh_token(provider, customer_id)
+    rt = await _db(load_refresh_token, provider, customer_id)
     access_token = await refresh_access_token(provider, rt)
     await sync_calendars_from_provider(provider, customer_id, access_token)
 
     return {
         "customerId": customer_id,
         "provider": provider,
-        "calendars": list_calendars_db(provider, customer_id),
+        "calendars": await _db(list_calendars_db, provider, customer_id),
     }
 
 
@@ -2251,7 +2263,7 @@ async def freebusy_handler(provider: str, request: Request, payload: Dict[str, A
     if not customer_id:
         raise HTTPException(status_code=400, detail="customerId required")
 
-    settings = ensure_customer_settings(customer_id)
+    settings = await _db(ensure_customer_settings, customer_id)
     tz_name = payload.get("timeZone") or settings["timezone"]
 
     try:
@@ -2261,13 +2273,13 @@ async def freebusy_handler(provider: str, request: Request, payload: Dict[str, A
         raise HTTPException(status_code=400, detail="timeMinUtc and timeMaxUtc required and must be ISO (Z or offset)")
 
     cal_ids = payload.get("calendarIds")
-    calendar_ids = cal_ids if isinstance(cal_ids, list) and cal_ids else selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider))
+    calendar_ids = cal_ids if isinstance(cal_ids, list) and cal_ids else await _db(selected_calendar_ids, provider, customer_id, provider_default_calendar_id(provider))
     calendar_ids = [c for c in calendar_ids if c]
 
     if not calendar_ids:
         raise HTTPException(status_code=400, detail=f"No {provider} calendars selected/found")
 
-    rt = load_refresh_token(provider, customer_id)
+    rt = await _db(load_refresh_token, provider, customer_id)
     access_token = await refresh_access_token(provider, rt)
 
     pack = await collect_busy_utc(
@@ -2292,7 +2304,7 @@ async def check_availability_handler(provider: str, request: Request, payload: D
     if not customer_id:
         raise HTTPException(status_code=400, detail="customerId required")
 
-    settings = ensure_customer_settings(customer_id)
+    settings = await _db(ensure_customer_settings, customer_id)
     tz_name = payload.get("timeZone") or settings["timezone"]
     work_start = int(payload.get("workStartHour", settings["work_start_hour"]))
     work_end = int(payload.get("workEndHour", settings["work_end_hour"]))
@@ -2319,7 +2331,8 @@ async def check_availability_handler(provider: str, request: Request, payload: D
     days = int(payload.get("days", 7))
 
     cal_ids = payload.get("calendarIds")
-    calendar_ids = cal_ids if isinstance(cal_ids, list) and cal_ids else selected_calendar_ids(
+    calendar_ids = cal_ids if isinstance(cal_ids, list) and cal_ids else await _db(
+        selected_calendar_ids,
         provider,
         customer_id,
         provider_default_calendar_id(provider),
@@ -2328,7 +2341,7 @@ async def check_availability_handler(provider: str, request: Request, payload: D
     if not calendar_ids:
         raise HTTPException(status_code=400, detail=f"No {provider} calendars selected/found")
 
-    rt = load_refresh_token(provider, customer_id)
+    rt = await _db(load_refresh_token, provider, customer_id)
     access_token = await refresh_access_token(provider, rt)
 
     exact_min = start_utc - timedelta(minutes=1)
@@ -2373,7 +2386,7 @@ async def check_availability_handler(provider: str, request: Request, payload: D
     horizon_max_utc = horizon_end_local.astimezone(timezone.utc)
 
     years = nth_years_to_cover(datetime.now().year, datetime.now().year + 1, start_utc.year, end_utc.year)
-    closed_dates = combined_closed_date_set(customer_id, years=years)
+    closed_dates = await _db(combined_closed_date_set, customer_id, years=years)
 
     horizon_busy_pack = await collect_busy_utc(
         provider=provider,
@@ -2465,13 +2478,13 @@ async def availability_handler(provider: str, request: Request, payload: Dict[st
         )
     )
     if has_exact_interval:
-        return check_availability_handler(provider, request, payload)
+        return await check_availability_handler(provider, request, payload)
 
     customer_id = payload.get("customerId")
     if not customer_id:
         raise HTTPException(status_code=400, detail="customerId required")
 
-    settings = ensure_customer_settings(customer_id)
+    settings = await _db(ensure_customer_settings, customer_id)
     tz_name = payload.get("timeZone") or settings["timezone"]
     work_start = int(payload.get("workStartHour", settings["work_start_hour"]))
     work_end = int(payload.get("workEndHour", settings["work_end_hour"]))
@@ -2482,7 +2495,7 @@ async def availability_handler(provider: str, request: Request, payload: Dict[st
     days = int(payload.get("days", 7))
 
     cal_ids = payload.get("calendarIds")
-    calendar_ids = cal_ids if isinstance(cal_ids, list) and cal_ids else selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider))
+    calendar_ids = cal_ids if isinstance(cal_ids, list) and cal_ids else await _db(selected_calendar_ids, provider, customer_id, provider_default_calendar_id(provider))
     calendar_ids = [c for c in calendar_ids if c]
     if not calendar_ids:
         raise HTTPException(status_code=400, detail=f"No {provider} calendars selected/found")
@@ -2503,7 +2516,7 @@ async def availability_handler(provider: str, request: Request, payload: Dict[st
     if preference is not None and not isinstance(preference, dict):
         preference = None
 
-    rt = load_refresh_token(provider, customer_id)
+    rt = await _db(load_refresh_token, provider, customer_id)
     access_token = await refresh_access_token(provider, rt)
 
     tz = zoneinfo_from_any_tz(tz_name, fallback="UTC")
@@ -2515,7 +2528,7 @@ async def availability_handler(provider: str, request: Request, payload: Dict[st
     time_max_utc = horizon_end_local.astimezone(timezone.utc)
 
     current_year = datetime.now().year
-    closed_dates = combined_closed_date_set(customer_id, years=[current_year, current_year + 1])
+    closed_dates = await _db(combined_closed_date_set, customer_id, years=[current_year, current_year + 1])
 
     busy_pack = await collect_busy_utc(
         provider=provider,
@@ -2566,12 +2579,12 @@ async def create_event_handler(
     if not customer_id:
         raise HTTPException(status_code=400, detail="customerId required")
 
-    settings = ensure_customer_settings(customer_id)
+    settings = await _db(ensure_customer_settings, customer_id)
     tz_name = payload.get("timeZone") or settings["timezone"]
 
     calendar_id = (payload.get("calendarId") or "").strip()
     if not calendar_id:
-        sel = selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider))
+        sel = await _db(selected_calendar_ids, provider, customer_id, provider_default_calendar_id(provider))
         sel = [c for c in sel if c]
         if not sel:
             raise HTTPException(status_code=400, detail=f"No {provider} calendarId provided and none selected")
@@ -2605,7 +2618,7 @@ async def create_event_handler(
 
     local_tz = zoneinfo_from_any_tz(tz_name, fallback="UTC")
     start_local_date = start_utc.astimezone(local_tz).date().isoformat()
-    closed_dates = combined_closed_date_set(customer_id, years=[start_utc.year, end_utc.year])
+    closed_dates = await _db(combined_closed_date_set, customer_id, years=[start_utc.year, end_utc.year])
 
     if start_local_date in closed_dates:
         return {
@@ -2614,10 +2627,11 @@ async def create_event_handler(
             "message": "That business is closed on the requested date. Please pick another day.",
         }
 
-    rt = load_refresh_token(provider, customer_id)
+    rt = await _db(load_refresh_token, provider, customer_id)
     access_token = await refresh_access_token(provider, rt)
+    logger.info("Creating event provider=%s customer=%s calendar=%s start=%s", provider, customer_id, calendar_id, iso_z(start_utc))
 
-    calendars_to_check = selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider))
+    calendars_to_check = await _db(selected_calendar_ids, provider, customer_id, provider_default_calendar_id(provider))
     calendars_to_check = [c for c in calendars_to_check if c]
     if calendar_id not in calendars_to_check:
         calendars_to_check = [calendar_id] + calendars_to_check
@@ -2692,11 +2706,11 @@ async def search_events_handler(provider: str, request: Request, payload: Dict[s
     if not customer_id:
         raise HTTPException(status_code=400, detail="customerId required")
 
-    settings = ensure_customer_settings(customer_id)
+    settings = await _db(ensure_customer_settings, customer_id)
     tz_name = payload.get("timeZone") or settings["timezone"]
 
     cal_ids = payload.get("calendarIds")
-    calendar_ids = cal_ids if isinstance(cal_ids, list) and cal_ids else selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider))
+    calendar_ids = cal_ids if isinstance(cal_ids, list) and cal_ids else await _db(selected_calendar_ids, provider, customer_id, provider_default_calendar_id(provider))
     calendar_ids = [c for c in calendar_ids if c]
     if not calendar_ids:
         raise HTTPException(status_code=400, detail=f"No {provider} calendars selected/found")
@@ -2723,7 +2737,7 @@ async def search_events_handler(provider: str, request: Request, payload: Dict[s
     time_min -= timedelta(minutes=1)
     time_max += timedelta(minutes=1)
 
-    rt = load_refresh_token(provider, customer_id)
+    rt = await _db(load_refresh_token, provider, customer_id)
     access_token = await refresh_access_token(provider, rt)
 
     matches = await provider_search_events(
@@ -2752,7 +2766,7 @@ async def cancel_events_handler(provider: str, request: Request, payload: Dict[s
     if not isinstance(items, list):
         raise HTTPException(status_code=400, detail="items must be a list")
 
-    rt = load_refresh_token(provider, customer_id)
+    rt = await _db(load_refresh_token, provider, customer_id)
     access_token = await refresh_access_token(provider, rt)
 
     async def _delete_one(it: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -2775,8 +2789,9 @@ async def cancel_events_handler(provider: str, request: Request, payload: Dict[s
     results = [r for r in raw_results if isinstance(r, dict)]
 
     # Trigger sheet sync
-    settings = ensure_customer_settings(customer_id)
-    cal_ids = selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider))
+    settings = await _db(ensure_customer_settings, customer_id)
+    cal_ids = await _db(selected_calendar_ids, provider, customer_id, provider_default_calendar_id(provider))
+    logger.info("Cancelled %d events provider=%s customer=%s", len(results), provider, customer_id)
     asyncio.create_task(_sheet_sync_safe(customer_id, provider, access_token, cal_ids, settings["timezone"]))
 
     return {"ok": True, "provider": provider, "requested": len(items), "processed": len(results), "results": results}
@@ -2790,17 +2805,17 @@ async def reschedule_events_handler(provider: str, request: Request, payload: Di
     if not customer_id:
         raise HTTPException(status_code=400, detail="customerId required")
 
-    settings = ensure_customer_settings(customer_id)
+    settings = await _db(ensure_customer_settings, customer_id)
     tz_name = payload.get("timeZone") or settings["timezone"]
 
     items = payload.get("items")
     if not isinstance(items, list):
         raise HTTPException(status_code=400, detail="items must be a list")
 
-    rt = load_refresh_token(provider, customer_id)
+    rt = await _db(load_refresh_token, provider, customer_id)
     access_token = await refresh_access_token(provider, rt)
 
-    calendars_to_check = selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider))
+    calendars_to_check = await _db(selected_calendar_ids, provider, customer_id, provider_default_calendar_id(provider))
     calendars_to_check = [c for c in calendars_to_check if c]
     if not calendars_to_check:
         raise HTTPException(status_code=400, detail=f"No {provider} calendars selected/found")
@@ -2837,7 +2852,7 @@ async def reschedule_events_handler(provider: str, request: Request, payload: Di
 
         local_tz = zoneinfo_from_any_tz(tz_name, fallback="UTC")
         new_local_date = new_start.astimezone(local_tz).date().isoformat()
-        closed_dates = combined_closed_date_set(customer_id, years=[new_start.year, new_end.year])
+        closed_dates = await _db(combined_closed_date_set, customer_id, years=[new_start.year, new_end.year])
         if new_local_date in closed_dates:
             results.append(
                 {
@@ -3350,7 +3365,8 @@ async def schedule(request: Request, payload: Dict[str, Any]):
                 )
                 return base
 
-            hold = create_slot_hold(
+            hold = await _db(
+                create_slot_hold,
                 provider=provider,
                 customer_id=customer_id,
                 calendar_id=(payload.get("calendarId") or ""),
@@ -3378,7 +3394,7 @@ async def schedule(request: Request, payload: Dict[str, Any]):
                     exclude_hold_token=hold["holdToken"],
                 )
             finally:
-                release_slot_hold(hold["holdToken"])
+                await _db(release_slot_hold, hold["holdToken"])
 
             if create_out.get("booked"):
                 base = {
@@ -3567,10 +3583,10 @@ async def internal_sync(provider: str, customer_id: str, request: Request):
     require_api_key(request)
     provider = validate_provider(provider)
 
-    rt = load_refresh_token(provider, customer_id)
+    rt = await _db(load_refresh_token, provider, customer_id)
     access_token = await refresh_access_token(provider, rt)
-    settings = ensure_customer_settings(customer_id)
-    calendar_ids = selected_calendar_ids(provider, customer_id, provider_default_calendar_id(provider))
+    settings = await _db(ensure_customer_settings, customer_id)
+    calendar_ids = await _db(selected_calendar_ids, provider, customer_id, provider_default_calendar_id(provider))
 
     await _sheet_sync_safe(customer_id, provider, access_token, calendar_ids, settings["timezone"])
     return {"ok": True, "synced": True, "provider": provider, "customerId": customer_id}
