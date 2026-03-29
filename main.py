@@ -2015,12 +2015,9 @@ async def provider_search_events(
                 hay = "\n".join(hay_parts).lower()
                 hay_phone = digits_only(summ + "\n" + desc)
 
-                ok = True
-                if email:
-                    ok = ok and (email in hay)
-                if phone_digits:
-                    ok = ok and (phone_digits in hay_phone)
-                if not ok:
+                email_match = (email in hay) if email else False
+                phone_match = (phone_digits in hay_phone) if phone_digits else False
+                if not email_match and not phone_match:
                     continue
 
                 start_dt = (ev.get("start") or {}).get("dateTime")
@@ -2071,12 +2068,9 @@ async def provider_search_events(
                 hay = "\n".join(hay_parts).lower()
                 hay_phone = digits_only("\n".join([subject, body_preview, body_content]))
 
-                ok = True
-                if email:
-                    ok = ok and (email in hay)
-                if phone_digits:
-                    ok = ok and (phone_digits in hay_phone)
-                if not ok:
+                email_match = (email in hay) if email else False
+                phone_match = (phone_digits in hay_phone) if phone_digits else False
+                if not email_match and not phone_match:
                     continue
 
                 s_utc = microsoft_event_time_to_utc(ev.get("start") or {}, fallback_tz_name=tz_name)
