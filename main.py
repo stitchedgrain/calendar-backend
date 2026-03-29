@@ -3097,8 +3097,6 @@ def build_assistant_response(
         "selectedAction": intent,
         "options": options,
         "appointments": appointments,
-        "optionsJson": json.dumps(options),
-        "appointmentsJson": json.dumps(appointments),
         "bookingConfirmed": bool(booked),
         "cancellationConfirmed": bool(cancelled),
         "rescheduleConfirmed": bool(rescheduled),
