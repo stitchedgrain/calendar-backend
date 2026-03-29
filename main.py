@@ -1523,7 +1523,6 @@ async def microsoft_calendar_view_api(
             "startDateTime": iso_z(time_min_utc),
             "endDateTime": iso_z(time_max_utc),
             "$top": "1000",
-            "$select": "id,subject,bodyPreview,body,start,end,attendees,isCancelled",
         },
     )
     return {"statusCode": r.status_code, "json": safe_json(r), "text": r.text}
@@ -2055,9 +2054,8 @@ async def provider_search_events(
 
                 subject = (ev.get("subject") or "").strip()
                 body_preview = (ev.get("bodyPreview") or "").strip()
-                body_content = ((ev.get("body") or {}).get("content") or "").strip()
 
-                hay_parts = [subject, body_preview, body_content]
+                hay_parts = [subject, body_preview]
                 if search_attendees:
                     for a in (ev.get("attendees") or []):
                         if isinstance(a, dict):
@@ -2066,7 +2064,7 @@ async def provider_search_events(
                                 hay_parts.append(addr)
 
                 hay = "\n".join(hay_parts).lower()
-                hay_phone = digits_only("\n".join([subject, body_preview, body_content]))
+                hay_phone = digits_only("\n".join([subject, body_preview]))
 
                 email_match = (email in hay) if email else False
                 phone_match = (phone_digits in hay_phone) if phone_digits else False
