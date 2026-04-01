@@ -3564,8 +3564,8 @@ async def _sheet_sync_safe(
             http_client=_http,
             semaphore=_api_semaphore,
         )
-    except Exception:
-        pass  # sync failures are non-critical
+    except Exception as e:
+        logger.exception("Sheet sync failed for %s/%s: %s", provider, customer_id, e)
 
 
 @app.post("/internal/sync/{provider}/{customer_id}")
@@ -3582,7 +3582,15 @@ async def internal_sync(provider: str, customer_id: str, request: Request):
     settings = await _db(ensure_customer_settings, customer_id)
     calendar_ids = await _db(selected_calendar_ids, provider, customer_id, provider_default_calendar_id(provider))
 
-    await _sheet_sync_safe(customer_id, provider, access_token, calendar_ids, settings["timezone"])
+    await sheets_sync.sync_customer_provider_to_sheet(
+        customer_id=customer_id,
+        provider=provider,
+        access_token=access_token,
+        calendar_ids=[c for c in calendar_ids if c],
+        customer_tz=settings["timezone"],
+        http_client=_http,
+        semaphore=_api_semaphore,
+    )
     return {"ok": True, "synced": True, "provider": provider, "customerId": customer_id}
 
 
