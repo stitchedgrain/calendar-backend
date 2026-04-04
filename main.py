@@ -498,6 +498,20 @@ def pick_by_preference(
     if tod not in ("morning", "afternoon", "any"):
         tod = "any"
 
+    # minHour / maxHour: filter slots to a specific hour range (0-23)
+    min_hour: Optional[int] = None
+    max_hour: Optional[int] = None
+    try:
+        if pref.get("minHour") is not None:
+            min_hour = int(pref["minHour"])
+    except Exception:
+        pass
+    try:
+        if pref.get("maxHour") is not None:
+            max_hour = int(pref["maxHour"])
+    except Exception:
+        pass
+
     def is_morning(dt_utc: datetime) -> bool:
         return dt_utc.astimezone(tz).hour < 12
 
@@ -507,11 +521,16 @@ def pick_by_preference(
         except Exception:
             return False
 
+        local_hour = s.astimezone(tz).hour
         if wanted_weekday is not None and s.astimezone(tz).weekday() != wanted_weekday:
             return False
         if force_tod == "morning" and not is_morning(s):
             return False
         if force_tod == "afternoon" and is_morning(s):
+            return False
+        if min_hour is not None and local_hour < min_hour:
+            return False
+        if max_hour is not None and local_hour >= max_hour:
             return False
         return True
 
