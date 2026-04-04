@@ -486,6 +486,7 @@ def pick_by_preference(
 
     pref = preference or {}
     max_results = int(pref.get("maxResults", 3))
+    skip = int(pref.get("skip", 0))  # skip N already-shown results
 
     wanted_weekday = None
     weekday_raw = str(pref.get("weekday", "")).strip()
@@ -550,21 +551,22 @@ def pick_by_preference(
                 (parse_iso_to_utc(x["startUtc"]) - preferred_utc).total_seconds()
             )
         )
-        return filtered[:max_results]
+        return filtered[skip:skip + max_results]
 
     if strategy == "spread":
-        if len(filtered) <= max_results:
-            return filtered
-        step = max(1, len(filtered) // max_results)
+        filtered_skipped = filtered[skip:]
+        if len(filtered_skipped) <= max_results:
+            return filtered_skipped
+        step = max(1, len(filtered_skipped) // max_results)
         out = []
         idx = 0
-        while len(out) < max_results and idx < len(filtered):
-            out.append(filtered[idx])
+        while len(out) < max_results and idx < len(filtered_skipped):
+            out.append(filtered_skipped[idx])
             idx += step
         return out[:max_results]
 
     filtered.sort(key=lambda x: x["startUtc"])
-    return filtered[:max_results]
+    return filtered[skip:skip + max_results]
 
 
 # =============================================================================
